@@ -597,7 +597,9 @@ impl Miner {
         let inner_submit_only_best = self.submit_only_best;
         self.executor.clone().spawn(
             ReceiverStream::new(self.rx_nonce_data)
-                .for_each(move |nonce_data| {
+                .for_each(move |nonce_data| async move {
+                    let state = state.clone();
+                    let request_handler = request_handler.clone();
                     #[cfg(feature = "async_io")]
                     let mut state = state.lock().await;
                     #[cfg(not(feature = "async_io"))]
@@ -672,7 +674,6 @@ impl Miner {
                             }
                         }
                     }
-                    futures_util::future::ready(())
                 }),
         );
         loop {
