@@ -150,6 +150,16 @@ impl RequestHandler {
             error!("can't send submission params: {}", e);
         }
     }
+
+    #[cfg(feature = "async_io")]
+    pub async fn update_capacity(&mut self, total_size_gb: usize) {
+        self.client.update_capacity(total_size_gb).await;
+    }
+
+    #[cfg(not(feature = "async_io"))]
+    pub fn update_capacity(&mut self, total_size_gb: usize) {
+        self.client.update_capacity(total_size_gb);
+    }
 }
 
 fn log_deadline_mismatch(

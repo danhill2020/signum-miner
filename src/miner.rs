@@ -43,8 +43,12 @@ use page_size;
 
 
 pub struct Miner {
-    reader: Reader,
-    request_handler: RequestHandler,
+    plot_dirs: Vec<PathBuf>,
+    hdd_use_direct_io: bool,
+    benchmark_cpu: bool,
+    capacity_check_interval: u64,
+    reader: Arc<Mutex<Reader>>,
+    request_handler: Arc<Mutex<RequestHandler>>,
     rx_nonce_data: mpsc::Receiver<NonceData>,
     target_deadline: u64,
     account_id_to_target_deadline: HashMap<u64, u64>,
@@ -452,8 +456,12 @@ impl Miner {
         let tx_read_replies_gpu = None;
 
         Miner {
+            plot_dirs: cfg.plot_dirs.clone(),
+            hdd_use_direct_io: cfg.hdd_use_direct_io,
+            benchmark_cpu: cfg.benchmark_cpu(),
+            capacity_check_interval: cfg.capacity_check_interval,
             reader_task_count: drive_id_to_plots.len(),
-            reader: Reader::new(
+            reader: Arc::new(Mutex::new(Reader::new(
                 drive_id_to_plots,
                 total_size,
                 reader_thread_count,
@@ -465,11 +473,11 @@ impl Miner {
                 cfg.show_drive_stats,
                 cfg.cpu_thread_pinning,
                 cfg.benchmark_cpu(),
-            ),
+            )),
             rx_nonce_data,
             target_deadline: cfg.target_deadline,
             account_id_to_target_deadline: cfg.account_id_to_target_deadline,
-            request_handler: RequestHandler::new(
+            request_handler: Arc::new(Mutex::new(RequestHandler::new(
                 cfg.url,
                 cfg.account_id_to_secret_phrase,
                 cfg.timeout,
@@ -477,7 +485,7 @@ impl Miner {
                 cfg.send_proxy_details,
                 cfg.additional_headers,
                 executor.clone(),
-            ),
+            ))),
             state: Arc::new(Mutex::new(State::new())),
             // floor at 1s to protect servers
             get_mining_info_interval: max(1000, cfg.get_mining_info_interval),
@@ -487,20 +495,55 @@ impl Miner {
         }
     }
 
+    pub async fn refresh_capacity(&self) {
+        let (drive_id_to_plots, total_size) =
+            scan_plots(&self.plot_dirs, self.hdd_use_direct_io, self.benchmark_cpu);
+
+        #[cfg(feature = "async_io")]
+        let mut reader = self.reader.lock().await;
+        #[cfg(not(feature = "async_io"))]
+        let mut reader = self.reader.lock().unwrap();
+        let old_size = reader.total_size;
+        reader.update_plots(drive_id_to_plots, total_size, self.benchmark_cpu);
+        drop(reader);
+
+        let total_size_gb = (total_size * 4 / 1024 / 1024) as usize;
+        #[cfg(feature = "async_io")]
+        {
+            let mut rh = self.request_handler.lock().await;
+            rh.update_capacity(total_size_gb).await;
+        }
+        #[cfg(not(feature = "async_io"))]
+        {
+            let mut rh = self.request_handler.lock().unwrap();
+            rh.update_capacity(total_size_gb);
+        }
+
+        if old_size != total_size {
+            info!(
+                "updated total capacity: {:.4} TiB",
+                (total_size / 64) as f64 / 4.0 / 1024.0 / 1024.0
+            );
+        }
+    }
+
     pub async fn run(self) {
         use tokio::time::{sleep, Duration};
-        let request_handler = self.request_handler.clone();
-        let total_size = self.reader.total_size;
+        let miner = Arc::new(self);
 
-        // TODO: this doesn't need to be arc mutex if we manage to separate
-        // reader from miner so that we can simply move it
-        let reader = Arc::new(Mutex::new(self.reader));
+        let request_handler = miner.request_handler.clone();
+        #[cfg(feature = "async_io")]
+        let total_size = { miner.reader.lock().await.total_size };
+        #[cfg(not(feature = "async_io"))]
+        let total_size = { miner.reader.lock().unwrap().total_size };
+
+        let reader = miner.reader.clone();
 
 
-        let state = self.state.clone();
+        let state = miner.state.clone();
         // there might be a way to solve this without two nested moves
-        let get_mining_info_interval = self.get_mining_info_interval;
-        let wakeup_after = self.wakeup_after;
+        let get_mining_info_interval = miner.get_mining_info_interval;
+        let wakeup_after = miner.wakeup_after;
         tokio::spawn(async move {
             info!("→ Interval task started");
             Interval::new_interval(Duration::from_millis(get_mining_info_interval))
@@ -509,7 +552,10 @@ impl Miner {
                     let reader = reader.clone();
                     let request_handler = request_handler.clone();
                     async move {
-                        let mining_info = request_handler.get_mining_info();
+                        #[cfg(feature = "async_io")]
+                        let mining_info = { request_handler.lock().await.get_mining_info() };
+                        #[cfg(not(feature = "async_io"))]
+                        let mining_info = { request_handler.lock().unwrap().get_mining_info() };
                         match mining_info.await {
                             Ok(mining_info) => {
                                 #[cfg(feature = "async_io")]
@@ -575,7 +621,19 @@ impl Miner {
                         }
                     }
                 })
-                .await; 
+                .await;
+        });
+
+        let miner_refresh = miner.clone();
+        tokio::spawn(async move {
+            Interval::new_interval(Duration::from_secs(miner_refresh.capacity_check_interval))
+                .for_each(move |_| {
+                    let miner_refresh = miner_refresh.clone();
+                    async move {
+                        miner_refresh.refresh_capacity().await;
+                    }
+                })
+                .await;
         });
 
         // only start submitting nonces after a while
@@ -589,14 +647,14 @@ impl Miner {
             account_id: 0,
         };
 
-        let target_deadline = self.target_deadline;
-        let account_id_to_target_deadline = self.account_id_to_target_deadline;
-        let request_handler = self.request_handler.clone();
-        let state = self.state.clone();
-        let reader_task_count = self.reader_task_count;
-        let inner_submit_only_best = self.submit_only_best;
-        self.executor.clone().spawn(
-            ReceiverStream::new(self.rx_nonce_data)
+        let target_deadline = miner.target_deadline;
+        let account_id_to_target_deadline = miner.account_id_to_target_deadline;
+        let request_handler = miner.request_handler.clone();
+        let state = miner.state.clone();
+        let reader_task_count = miner.reader_task_count;
+        let inner_submit_only_best = miner.submit_only_best;
+        miner.executor.clone().spawn(
+            ReceiverStream::new(miner.rx_nonce_data)
                 .for_each(move |nonce_data| {
                     let state = state.clone();
                     let request_handler = request_handler.clone();
@@ -629,7 +687,18 @@ impl Miner {
                                 if inner_submit_only_best {
                                     best_nonce_data = nonce_data.clone();
                                 } else {
-                                    request_handler.submit_nonce(
+                                    #[cfg(feature = "async_io")]
+                                    request_handler.lock().await.submit_nonce(
+                                        nonce_data.account_id,
+                                        nonce_data.nonce,
+                                        nonce_data.height,
+                                        nonce_data.block,
+                                        nonce_data.deadline,
+                                        deadline,
+                                        state.generation_signature_bytes,
+                                    );
+                                    #[cfg(not(feature = "async_io"))]
+                                    request_handler.lock().unwrap().submit_nonce(
                                         nonce_data.account_id,
                                         nonce_data.nonce,
                                         nonce_data.height,
@@ -660,7 +729,18 @@ impl Miner {
                                     if best_nonce_data.height == state.height {
                                         let deadline =
                                             best_nonce_data.deadline / best_nonce_data.base_target;
-                                        request_handler.submit_nonce(
+                                        #[cfg(feature = "async_io")]
+                                        request_handler.lock().await.submit_nonce(
+                                            best_nonce_data.account_id,
+                                            best_nonce_data.nonce,
+                                            best_nonce_data.height,
+                                            best_nonce_data.block,
+                                            best_nonce_data.deadline,
+                                            deadline,
+                                            state.generation_signature_bytes,
+                                        );
+                                        #[cfg(not(feature = "async_io"))]
+                                        request_handler.lock().unwrap().submit_nonce(
                                             best_nonce_data.account_id,
                                             best_nonce_data.nonce,
                                             best_nonce_data.height,
