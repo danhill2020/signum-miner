@@ -120,6 +120,9 @@ pub fn hash(
         let mut offset: u64 = 0;
 
         let bs = buffer.get_buffer_for_writing();
+#[cfg(feature = "async_io")]
+        let bs = bs.blocking_lock();
+#[cfg(not(feature = "async_io"))]
         let bs = bs.lock().unwrap();
 
         #[cfg(feature = "simd_avx512f")]

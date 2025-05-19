@@ -9,7 +9,11 @@ use pbr::{ProgressBar, Units};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Stdout;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "async_io")]
+use tokio::sync::Mutex;
+#[cfg(not(feature = "async_io"))]
+use std::sync::Mutex;
 use stopwatch::Stopwatch;
 
 pub struct BufferInfo {
@@ -366,6 +370,9 @@ impl Reader {
                 let mut nonces_processed = 0u64;
                 let plot_count = plots.len();
                 'outer: for (i_p, p) in plots.iter().enumerate() {
+#[cfg(feature = "async_io")]
+                    let mut p = p.lock().await;
+#[cfg(not(feature = "async_io"))]
                     let mut p = p.lock().unwrap();
                     if let Err(e) = p.prepare_async(scoop).await {
                         error!(
@@ -381,6 +388,9 @@ impl Reader {
                             sw.restart();
                         }
                         let mut_bs = buffer.get_buffer_for_writing();
+#[cfg(feature = "async_io")]
+                        let mut bs = mut_bs.lock().await;
+#[cfg(not(feature = "async_io"))]
                         let mut bs = mut_bs.lock().unwrap();
                         let (bytes_read, start_nonce, next_plot) = match p.read_async(&mut bs, scoop).await {
                             Ok(x) => x,
@@ -463,6 +473,9 @@ impl Reader {
 
                         match &pb {
                             Some(pb) => {
+#[cfg(feature = "async_io")]
+                                let mut pb = pb.lock().await;
+#[cfg(not(feature = "async_io"))]
                                 let mut pb = pb.lock().unwrap();
                                 pb.add(bytes_read as u64);
                             }
@@ -523,7 +536,12 @@ pub fn check_overlap(drive_id_to_plots: &HashMap<String, Arc<Vec<Mutex<Plot>>>>)
         .values()
         .map(|a| a.iter())
         .flatten()
-        .map(|plot| plot.lock().unwrap().meta.clone())
+        .map(|plot| {
+#[cfg(feature = "async_io")]
+            plot.blocking_lock().meta.clone()
+#[cfg(not(feature = "async_io"))]
+            plot.lock().unwrap().meta.clone()
+        })
         .collect();
     plots
         .par_iter()

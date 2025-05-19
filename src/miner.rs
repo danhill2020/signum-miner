@@ -27,7 +27,11 @@ use std::collections::HashMap;
 use std::fs::read_dir;
 use std::path::PathBuf;
 use std::process;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "async_io")]
+use tokio::sync::Mutex;
+#[cfg(not(feature = "async_io"))]
+use std::sync::Mutex;
 //use std::sync::Arc;
 //use tokio::sync::Mutex;
 use std::thread;

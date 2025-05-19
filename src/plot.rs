@@ -303,6 +303,25 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         self.fh.seek(SeekFrom::Start(seek_addr))
     }
 
+    #[cfg(feature = "async_io")]
+    pub fn seek_random(&mut self) -> io::Result<u64> {
+        let mut rng = thread_rng();
+        let rand_scoop = rng.gen_range(0, SCOOPS_IN_NONCE);
+
+        let mut seek_addr = rand_scoop as u64 * self.meta.nonces as u64 * SCOOP_SIZE;
+        if self.use_direct_io {
+            self.round_seek_addr(&mut seek_addr);
+        }
+
+        let mut f = if self.use_direct_io {
+            open_using_direct_io(&self.path)?
+        } else {
+            open(&self.path)?
+        };
+
+        f.seek(SeekFrom::Start(seek_addr))
+    }
+
     fn round_seek_addr(&mut self, seek_addr: &mut u64) -> u64 {
         let r = *seek_addr % self.sector_size;
         if r != 0 {

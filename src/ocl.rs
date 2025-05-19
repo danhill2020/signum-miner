@@ -9,7 +9,11 @@ use std::cmp::{max, min};
 use std::ffi::CString;
 use std::process;
 use std::slice::from_raw_parts_mut;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(feature = "async_io")]
+use tokio::sync::Mutex;
+#[cfg(not(feature = "async_io"))]
+use std::sync::Mutex;
 
 static SRC: &'static str = include_str!("ocl/kernel.cl");
 const SCOOP_SIZE: u64 = 64;
@@ -461,6 +465,9 @@ fn upload_gensig(gpu_context: &Arc<GpuContext>, gensig: [u8; 32], blocking: bool
 
 fn transfer_buffer_to_gpu(gpu_context: &Arc<GpuContext>, buffer: &GpuBuffer, blocking: bool) {
     let data = buffer.data.clone();
+#[cfg(feature = "async_io")]
+    let data2 = (*data).blocking_lock();
+#[cfg(not(feature = "async_io"))]
     let data2 = (*data).lock().unwrap();
     if gpu_context.mapping {
         let temp2 = buffer.buffer_ptr_host.as_ref().unwrap();
