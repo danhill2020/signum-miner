@@ -81,6 +81,10 @@ automatically disabled for plot directories residing on USB drives.
 default of 4&nbsp;MiB works well for most drives but you may lower it for slow
 USB devices.
 
+`capacity_check_interval` defines how often the miner rescans the plot
+directories to update its total capacity. The default of 6&nbsp;hours is a good
+balance for most setups.
+
 ### Running
 Be sure to have the config file on the same folder of your binary.</br>
 

@@ -84,6 +84,9 @@ pub struct Cfg {
     #[serde(default = "default_additional_headers")]
     pub additional_headers: HashMap<String, String>,
 
+    #[serde(default = "default_capacity_check_interval")]
+    pub capacity_check_interval: u64,
+
     #[serde(default = "default_console_log_level")]
     pub console_log_level: String,
 
@@ -210,6 +213,10 @@ fn default_timeout() -> u64 {
 
 fn default_send_proxy_details() -> bool {
     false
+}
+
+fn default_capacity_check_interval() -> u64 {
+    21600
 }
 
 fn default_additional_headers() -> HashMap<String, String> {

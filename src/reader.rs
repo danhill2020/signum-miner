@@ -172,6 +172,19 @@ impl Reader {
         }
     }
 
+    pub fn update_plots(
+        &mut self,
+        drive_id_to_plots: HashMap<String, Arc<Vec<Mutex<Plot>>>>,
+        total_size: u64,
+        benchmark: bool,
+    ) {
+        if !benchmark {
+            check_overlap(&drive_id_to_plots);
+        }
+        self.drive_id_to_plots = drive_id_to_plots;
+        self.total_size = total_size;
+    }
+
     #[cfg(not(feature = "async_io"))]
     fn create_read_task(
         &self,

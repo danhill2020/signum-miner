@@ -33,6 +33,7 @@ target_deadline: 31536000             # default 31536000 (1 year)
 # 1796535821016683299: 55555555
 
 get_mining_info_interval: 3000        # default 3000ms
+capacity_check_interval: 21600        # default 21600s
 timeout: 5000                         # default 5000ms
 send_proxy_details: false              # default false
 submit_only_best: true                # default true

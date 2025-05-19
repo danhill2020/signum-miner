@@ -1,5 +1,9 @@
 use crate::com::api::*;
 use reqwest::{Client as InnerClient, header::{HeaderMap, HeaderName}};
+#[cfg(feature = "async_io")]
+use tokio::sync::Mutex;
+#[cfg(not(feature = "async_io"))]
+use std::sync::Mutex;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +19,8 @@ pub struct Client {
     account_id_to_secret_phrase: Arc<HashMap<u64, String>>,
     base_uri: Url,
     total_size_gb: usize,
-    headers: Arc<HeaderMap>,
+    proxy_details: ProxyDetails,
+    headers: Arc<Mutex<HeaderMap>>,
 }
 
 /// Parameters used for nonce submission.
@@ -111,7 +116,7 @@ impl Client {
             *secret_phrase = byte_serialize(secret_phrase.as_bytes()).collect();
         }
 
-        let headers = Client::submit_nonce_headers(proxy_details, total_size_gb, additional_headers);
+        let headers = Client::submit_nonce_headers(proxy_details.clone(), total_size_gb, additional_headers);
 
         let client = InnerClient::builder()
             .timeout(Duration::from_millis(timeout))
@@ -123,7 +128,8 @@ impl Client {
             account_id_to_secret_phrase: Arc::new(secret_phrases),
             base_uri,
             total_size_gb,
-            headers: Arc::new(headers),
+            proxy_details,
+            headers: Arc::new(Mutex::new(headers)),
         }
     }
 
@@ -136,11 +142,34 @@ impl Client {
         url
     }
 
+    #[cfg(feature = "async_io")]
+    pub async fn update_capacity(&mut self, total_size_gb: usize) {
+        self.total_size_gb = total_size_gb;
+        if self.proxy_details == ProxyDetails::Enabled {
+            let mut headers = self.headers.lock().await;
+            headers.insert("X-Capacity", total_size_gb.to_string().parse().unwrap());
+        }
+    }
+
+    #[cfg(not(feature = "async_io"))]
+    pub fn update_capacity(&mut self, total_size_gb: usize) {
+        self.total_size_gb = total_size_gb;
+        if self.proxy_details == ProxyDetails::Enabled {
+            let mut headers = self.headers.lock().unwrap();
+            headers.insert("X-Capacity", total_size_gb.to_string().parse().unwrap());
+        }
+    }
+
     pub async fn get_mining_info(&self) -> Result<MiningInfoResponse, FetchError> {
+        #[cfg(feature = "async_io")]
+        let headers = { self.headers.lock().await.clone() };
+        #[cfg(not(feature = "async_io"))]
+        let headers = { self.headers.lock().unwrap().clone() };
+
         let res = self
             .inner
             .get(self.uri_for("burst"))
-            .headers((*self.headers).clone())
+            .headers(headers)
             .query(&GetMiningInfoRequest {
                 request_type: "getMiningInfo",
             })
@@ -174,7 +203,10 @@ impl Client {
             query += &format!("&deadline={}", submission_data.deadline_unadjusted);
         }
 
-        let mut headers = (*self.headers).clone();
+        #[cfg(feature = "async_io")]
+        let mut headers = { self.headers.lock().await.clone() };
+        #[cfg(not(feature = "async_io"))]
+        let mut headers = { self.headers.lock().unwrap().clone() };
         headers.insert(
             "X-Deadline",
             submission_data.deadline.to_string().parse().unwrap(),
