@@ -10,6 +10,8 @@ use tokio::fs::File as TokioFile;
 use std::fs::File as TokioFile;
 #[cfg(feature = "async_io")]
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+#[cfg(feature = "async_io")]
+use std::io::Seek;
 use std::io;
 use std::io::{SeekFrom};
 #[cfg(not(feature = "async_io"))]
