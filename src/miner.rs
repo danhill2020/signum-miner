@@ -32,8 +32,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 #[cfg(not(feature = "async_io"))]
 use std::sync::Mutex;
-//use std::sync::Arc;
-//use tokio::sync::Mutex;
 use std::thread;
 use std::u64;
 use stopwatch::Stopwatch;
