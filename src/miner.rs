@@ -32,8 +32,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 #[cfg(not(feature = "async_io"))]
 use std::sync::Mutex;
-//use std::sync::Arc;
-//use tokio::sync::Mutex;
 use std::thread;
 use std::u64;
 use stopwatch::Stopwatch;
@@ -473,7 +471,7 @@ impl Miner {
                 cfg.show_drive_stats,
                 cfg.cpu_thread_pinning,
                 cfg.benchmark_cpu(),
-            )),
+            ))),
             rx_nonce_data,
             target_deadline: cfg.target_deadline,
             account_id_to_target_deadline: cfg.account_id_to_target_deadline,
@@ -485,7 +483,7 @@ impl Miner {
                 cfg.send_proxy_details,
                 cfg.additional_headers,
                 executor.clone(),
-            )),
+            ))),
             state: Arc::new(Mutex::new(State::new())),
             // floor at 1s to protect servers
             get_mining_info_interval: max(1000, cfg.get_mining_info_interval),
