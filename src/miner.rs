@@ -28,6 +28,7 @@ use std::fs::read_dir;
 use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "async_io")]
 use tokio::sync::Mutex;
 #[cfg(not(feature = "async_io"))]
@@ -53,7 +54,7 @@ pub struct Miner {
     target_deadline: u64,
     account_id_to_target_deadline: HashMap<u64, u64>,
     state: Arc<Mutex<State>>,
-    reader_task_count: usize,
+    reader_task_count: Arc<AtomicUsize>,
     get_mining_info_interval: u64,
     executor: Handle,
     wakeup_after: i64,
@@ -460,7 +461,7 @@ impl Miner {
             hdd_use_direct_io: cfg.hdd_use_direct_io,
             benchmark_cpu: cfg.benchmark_cpu(),
             capacity_check_interval: cfg.capacity_check_interval,
-            reader_task_count: drive_id_to_plots.len(),
+            reader_task_count: Arc::new(AtomicUsize::new(drive_id_to_plots.len())),
             reader: Arc::new(Mutex::new(Reader::new(
                 drive_id_to_plots,
                 total_size,
@@ -485,7 +486,7 @@ impl Miner {
                 cfg.send_proxy_details,
                 cfg.additional_headers,
                 executor.clone(),
-            )),
+            ))),
             state: Arc::new(Mutex::new(State::new())),
             // floor at 1s to protect servers
             get_mining_info_interval: max(1000, cfg.get_mining_info_interval),
@@ -503,8 +504,12 @@ impl Miner {
         let mut reader = self.reader.lock().await;
         #[cfg(not(feature = "async_io"))]
         let mut reader = self.reader.lock().unwrap();
+        let new_drive_count = drive_id_to_plots.len();
         let old_size = reader.total_size;
         reader.update_plots(drive_id_to_plots, total_size, self.benchmark_cpu);
+        self
+            .reader_task_count
+            .store(new_drive_count, Ordering::Relaxed);
         drop(reader);
 
         let total_size_gb = (total_size * 4 / 1024 / 1024) as usize;
@@ -651,7 +656,7 @@ impl Miner {
         let account_id_to_target_deadline = miner.account_id_to_target_deadline;
         let request_handler = miner.request_handler.clone();
         let state = miner.state.clone();
-        let reader_task_count = miner.reader_task_count;
+        let reader_task_count = miner.reader_task_count.clone();
         let inner_submit_only_best = miner.submit_only_best;
         miner.executor.clone().spawn(
             ReceiverStream::new(miner.rx_nonce_data)
@@ -712,7 +717,9 @@ impl Miner {
 
                             if nonce_data.reader_task_processed {
                                 state.processed_reader_tasks += 1;
-                                if state.processed_reader_tasks == reader_task_count {
+                                if state.processed_reader_tasks
+                                    == reader_task_count.load(Ordering::Relaxed)
+                                {
                                     info!(
                                         "{: <80}",
                                         format!(
