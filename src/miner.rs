@@ -532,12 +532,7 @@ impl Miner {
         let miner = Arc::new(self);
 
         let request_handler = miner.request_handler.clone();
-        #[cfg(feature = "async_io")]
-        let total_size = { miner.reader.lock().await.total_size };
-        #[cfg(not(feature = "async_io"))]
-        let total_size = { miner.reader.lock().unwrap().total_size };
-
-        let reader = miner.reader.clone();
+        let reader_interval = miner.reader.clone();
 
 
         let state = miner.state.clone();
@@ -549,7 +544,7 @@ impl Miner {
             Interval::new_interval(Duration::from_millis(get_mining_info_interval))
                 .for_each(move |_| {
                     let state = state.clone();
-                    let reader = reader.clone();
+                    let reader = reader_interval.clone();
                     let request_handler = request_handler.clone();
                     async move {
                         #[cfg(feature = "async_io")]
@@ -636,6 +631,8 @@ impl Miner {
                 .await;
         });
 
+        let reader = miner.reader.clone();
+
         // only start submitting nonces after a while
         let mut best_nonce_data = NonceData {
             height: 0,
@@ -659,6 +656,7 @@ impl Miner {
                     let state = state.clone();
                     let request_handler = request_handler.clone();
                     let account_id_to_target_deadline = account_id_to_target_deadline.clone();
+                    let reader = reader.clone();
                     async move {
                         #[cfg(feature = "async_io")]
                         let mut state = state.lock().await;
@@ -713,6 +711,11 @@ impl Miner {
                             if nonce_data.reader_task_processed {
                                 state.processed_reader_tasks += 1;
                                 if state.processed_reader_tasks == reader_task_count {
+                                    #[cfg(feature = "async_io")]
+                                    let total_size = { reader.lock().await.total_size };
+                                    #[cfg(not(feature = "async_io"))]
+                                    let total_size = { reader.lock().unwrap().total_size };
+
                                     info!(
                                         "{: <80}",
                                         format!(
