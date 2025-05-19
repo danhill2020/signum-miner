@@ -598,10 +598,14 @@ impl Miner {
         self.executor.clone().spawn(
             ReceiverStream::new(self.rx_nonce_data)
                 .for_each(move |nonce_data| {
-                    #[cfg(feature = "async_io")]
-                    let mut state = state.lock().await;
-                    #[cfg(not(feature = "async_io"))]
-                    let mut state = state.lock().unwrap();
+                    let state = state.clone();
+                    let request_handler = request_handler.clone();
+                    let account_id_to_target_deadline = account_id_to_target_deadline.clone();
+                    async move {
+                        #[cfg(feature = "async_io")]
+                        let mut state = state.lock().await;
+                        #[cfg(not(feature = "async_io"))]
+                        let mut state = state.lock().unwrap();
 
                     let deadline = nonce_data.deadline / nonce_data.base_target;
                     if state.height == nonce_data.height {
@@ -672,7 +676,6 @@ impl Miner {
                             }
                         }
                     }
-                    futures_util::future::ready(())
                 }),
         );
         loop {
