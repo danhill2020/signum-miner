@@ -553,10 +553,16 @@ impl Miner {
                     let request_handler = request_handler.clone();
                     async move {
                         #[cfg(feature = "async_io")]
-                        let mining_info = { request_handler.lock().await.get_mining_info() };
+                        let mining_info = {
+                            let rh = request_handler.lock().await.clone();
+                            rh.get_mining_info().await
+                        };
                         #[cfg(not(feature = "async_io"))]
-                        let mining_info = { request_handler.lock().unwrap().get_mining_info() };
-                        match mining_info.await {
+                        let mining_info = {
+                            let rh = request_handler.lock().unwrap().clone();
+                            rh.get_mining_info().await
+                        };
+                        match mining_info {
                             Ok(mining_info) => {
                                 #[cfg(feature = "async_io")]
                                 let mut state = state.lock().await;
