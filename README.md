@@ -95,6 +95,19 @@ For Linux run it with the folliwing command:</br>
 ./signum-miner
 ```
 
+### GUI helper
+
+An optional Tkinter interface (`miner_ui.py`) allows you to edit
+`config.yaml`, start the miner and watch its logs within a single window.
+The interface uses tabs to separate configuration and log output for a cleaner
+experience.
+
+```bash
+python3 miner_ui.py
+```
+
+Ensure the `signum-miner` binary is available in the same directory.
+
 ---
 
 ## 💻 Build from Source
