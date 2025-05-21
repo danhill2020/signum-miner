@@ -95,6 +95,12 @@ For Linux run it with the folliwing command:</br>
 ./signum-miner
 ```
 
+### Quick Setup with `init`
+
+Run `signum-miner init` to create a default `config.yaml` in the
+current directory. Edit this file to match your plot directories and
+pool URL before starting the miner.
+
 ---
 
 ## 💻 Build from Source
@@ -122,8 +128,31 @@ cargo build --release --no-default-features --features simd_avx
 # Enable asynchronous disk I/O
 cargo build --release --features async_io
 
-# Default Build with avx2 features 
-cargo build --release 
+# Default Build with avx2 features
+cargo build --release
+```
+
+### Windows
+
+Use PowerShell to install Rust and build the miner:
+
+```powershell
+irm https://win.rustup.rs -OutFile rustup-init.exe
+./rustup-init.exe -y
+$env:Path += ";$env:USERPROFILE\.cargo\bin"
+git clone https://github.com/signum-network/signum-miner
+cd signum-miner
+cargo build --release
+```
+
+### Linux/macOS
+
+```bash
+curl https://sh.rustup.rs -sSf | sh -s -- -y
+source $HOME/.cargo/env
+git clone https://github.com/signum-network/signum-miner
+cd signum-miner
+cargo build --release
 ```
 
 ## 📜 License
