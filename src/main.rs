@@ -31,8 +31,23 @@ mod ocl;
 use crate::config::load_cfg;
 use crate::miner::Miner;
 use clap::{Arg, Command};
+use std::fs;
+use std::path::Path;
 #[cfg(feature = "opencl")]
 use std::process;
+
+const DEFAULT_CONFIG: &str = include_str!("../config.yaml");
+
+fn write_default_config(path: &str) -> std::io::Result<()> {
+    let cfg_path = Path::new(path);
+    if cfg_path.exists() {
+        println!("{} already exists, not overwriting", path);
+    } else {
+        fs::write(cfg_path, DEFAULT_CONFIG)?;
+        println!("Created {}", path);
+    }
+    Ok(())
+}
 
 cfg_if! {
     if #[cfg(feature = "simd_avx512f")] {
@@ -124,6 +139,10 @@ async fn main() {
                 .help("Location of the config file")
                 .default_value("config.yaml")
                 .required(false),
+        )
+        .subcommand(
+            Command::new("init")
+                .about("Generate a default config.yaml in the current directory"),
         );
 
     #[cfg(feature = "opencl")]
@@ -136,6 +155,15 @@ async fn main() {
     );
 
     let matches = cmd.get_matches();
+
+    if let Some(("init", _)) = matches.subcommand() {
+        if let Err(e) = write_default_config("config.yaml") {
+            eprintln!("Failed to create config: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let config = matches
         .get_one::<String>("config")
         .map(|s| s.as_str())
