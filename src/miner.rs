@@ -208,10 +208,10 @@ fn scan_plots(
         let is_usb = bus_type.to_lowercase() == "usb" || bus_type.to_lowercase() == "removable";
         let mut num_plots = 0;
         let mut local_capacity: u64 = 0;
-        for file in read_dir(plot_dir).unwrap() {
-            let file = &file.unwrap().path();
+        for entry in read_dir(plot_dir).unwrap() {
+            let file = entry.unwrap().path();
 
-            if let Ok(p) = Plot::new(file, use_direct_io && !is_usb, dummy) {
+            if let Ok(p) = Plot::new(&file, use_direct_io && !is_usb, dummy) {
                 let drive_id = get_device_id(&file.to_str().unwrap().to_string());
                 let plots = drive_id_to_plots.entry(drive_id).or_insert(Vec::new());
 
