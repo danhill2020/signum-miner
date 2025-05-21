@@ -104,7 +104,7 @@ cfg_if! {
 }
 
 impl Plot {
-    pub fn new(path: &PathBuf, mut use_direct_io: bool, dummy: bool) -> Result<Plot, Box<dyn Error>> {
+    pub fn new(path: &Path, mut use_direct_io: bool, dummy: bool) -> Result<Plot, Box<dyn Error>> {
         if !path.is_file() {
             return Err(From::from(format!(
                 "{} is not a file",
@@ -153,7 +153,7 @@ impl Plot {
             use_direct_io = false;
         }
 
-        let file_path = path.clone().into_os_string().into_string().unwrap();
+        let file_path = path.to_path_buf().into_os_string().into_string().unwrap();
         Ok(Plot {
             meta: Meta {
                 account_id,
