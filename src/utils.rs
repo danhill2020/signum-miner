@@ -1,5 +1,6 @@
 use core_affinity;
 use rayon;
+use std::path::PathBuf;
 
 pub fn new_thread_pool(num_threads: usize, thread_pinning: bool) -> rayon::ThreadPool {
     let core_ids = if thread_pinning {
@@ -118,6 +119,28 @@ cfg_if! {
             }
             String::from("unknown")
         }
+
+        pub fn get_mount_points() -> Vec<PathBuf> {
+            let mut points = Vec::new();
+            if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
+                for line in content.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        let mp = parts[1];
+                        if mp != "/"
+                            && !mp.starts_with("/proc")
+                            && !mp.starts_with("/sys")
+                            && !mp.starts_with("/dev")
+                            && !mp.starts_with("/run")
+                            && !mp.starts_with("/snap")
+                        {
+                            points.push(PathBuf::from(mp));
+                        }
+                    }
+                }
+            }
+            points
+        }
     } else {
         use winapi;
         use crate::utils::winapi::um::processthreadsapi::SetThreadIdealProcessor;
@@ -189,6 +212,21 @@ cfg_if! {
                 _ => "unknown",
             }
             .to_string()
+        }
+
+        pub fn get_mount_points() -> Vec<PathBuf> {
+            let mut points = Vec::new();
+            unsafe {
+                let mask = winapi::um::fileapi::GetLogicalDrives();
+                for i in 0..26 {
+                    if mask & (1 << i) != 0 {
+                        let letter = (b'A' + i as u8) as char;
+                        let path = format!("{}:\\", letter);
+                        points.push(PathBuf::from(path));
+                    }
+                }
+            }
+            points
         }
 
         pub fn set_thread_ideal_processor(id: usize){

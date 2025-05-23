@@ -14,17 +14,17 @@ use crate::plot::{Plot, SCOOP_SIZE};
 use crate::poc_hashing;
 use crate::reader::Reader;
 use crate::requests::RequestHandler;
-use crate::utils::{get_bus_type, get_device_id, new_thread_pool};
+use crate::utils::{get_bus_type, get_device_id, new_thread_pool, get_mount_points};
 use crossbeam_channel;
 use filetime::FileTime;
 use futures_util::{stream::StreamExt};
+use walkdir::WalkDir;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 #[cfg(feature = "opencl")]
 use ocl_core::Mem;
 use std::cmp::{max, min};
 use std::collections::HashMap;
-use std::fs::read_dir;
 use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
@@ -32,8 +32,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 #[cfg(not(feature = "async_io"))]
 use std::sync::Mutex;
-//use std::sync::Arc;
-//use tokio::sync::Mutex;
 use std::thread;
 use std::u64;
 use stopwatch::Stopwatch;
@@ -208,16 +206,17 @@ fn scan_plots(
         let is_usb = bus_type.to_lowercase() == "usb" || bus_type.to_lowercase() == "removable";
         let mut num_plots = 0;
         let mut local_capacity: u64 = 0;
-        for file in read_dir(plot_dir).unwrap() {
-            let file = &file.unwrap().path();
+        for entry in WalkDir::new(plot_dir).into_iter().filter_map(Result::ok) {
+            let file = entry.path();
+            if file.is_file() {
+                if let Ok(p) = Plot::new(file, use_direct_io && !is_usb, dummy) {
+                    let drive_id = get_device_id(&file.to_str().unwrap().to_string());
+                    let plots = drive_id_to_plots.entry(drive_id).or_insert(Vec::new());
 
-            if let Ok(p) = Plot::new(file, use_direct_io && !is_usb, dummy) {
-                let drive_id = get_device_id(&file.to_str().unwrap().to_string());
-                let plots = drive_id_to_plots.entry(drive_id).or_insert(Vec::new());
-
-                local_capacity += p.meta.nonces as u64;
-                plots.push(Mutex::new(p));
-                num_plots += 1;
+                    local_capacity += p.meta.nonces as u64;
+                    plots.push(Mutex::new(p));
+                    num_plots += 1;
+                }
             }
         }
 
@@ -262,8 +261,14 @@ fn scan_plots(
 
 impl Miner {
     pub fn new(cfg: Cfg, executor: Handle) -> Miner {
+        let mut dirs = cfg.plot_dirs.clone();
+        let mut mounts = get_mount_points();
+        dirs.append(&mut mounts);
+        dirs.sort();
+        dirs.dedup();
+
         let (drive_id_to_plots, total_size) =
-            scan_plots(&cfg.plot_dirs, cfg.hdd_use_direct_io, cfg.benchmark_cpu());
+            scan_plots(&dirs, cfg.hdd_use_direct_io, cfg.benchmark_cpu());
 
         let cpu_threads = cfg.cpu_threads.max(1);
         info!("🖥️  Using {} CPU thread(s)", cpu_threads);
@@ -456,7 +461,7 @@ impl Miner {
         let tx_read_replies_gpu = None;
 
         Miner {
-            plot_dirs: cfg.plot_dirs.clone(),
+            plot_dirs: dirs,
             hdd_use_direct_io: cfg.hdd_use_direct_io,
             benchmark_cpu: cfg.benchmark_cpu(),
             capacity_check_interval: cfg.capacity_check_interval,
@@ -496,8 +501,13 @@ impl Miner {
     }
 
     pub async fn refresh_capacity(&self) {
+        let mut dirs = self.plot_dirs.clone();
+        let mut mounts = get_mount_points();
+        dirs.append(&mut mounts);
+        dirs.sort();
+        dirs.dedup();
         let (drive_id_to_plots, total_size) =
-            scan_plots(&self.plot_dirs, self.hdd_use_direct_io, self.benchmark_cpu);
+            scan_plots(&dirs, self.hdd_use_direct_io, self.benchmark_cpu);
 
         #[cfg(feature = "async_io")]
         let mut reader = self.reader.lock().await;
