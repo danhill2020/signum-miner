@@ -104,7 +104,7 @@ available: **Home**, a raw YAML editor (**Config**), an **Options** tab for
 editing fields and a **Logs** tab to monitor output. Install the required
 packages first:
 ```bash
-pip install customtkinter pyyaml
+pip install customtkinter pyyaml pillow
 ```
 You can then edit `config.yaml`, start or stop the miner and monitor its log
 output in a more user friendly window.
