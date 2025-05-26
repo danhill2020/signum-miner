@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import yaml
+from PIL import Image
 
 class MinerUI:
     def __init__(self, master):
@@ -31,7 +32,8 @@ class MinerUI:
         # Home tab content
         logo_path = os.path.join(os.path.dirname(__file__), "signum_logo.png")
         if os.path.exists(logo_path):
-            self.logo_image = tk.PhotoImage(file=logo_path)
+            image = Image.open(logo_path)
+            self.logo_image = ctk.CTkImage(light_image=image, dark_image=image)
             ctk.CTkLabel(self.home_tab, image=self.logo_image, text="").pack(pady=10)
         ctk.CTkLabel(
             self.home_tab,
