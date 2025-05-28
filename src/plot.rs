@@ -56,6 +56,8 @@ pub struct Plot {
     pub path: String,
     pub fh: TokioFile,
     read_offset: u64,
+    align_offset: u64,
+    seek_base: u64,
     use_direct_io: bool,
     sector_size: u64,
     dummy: bool,
@@ -164,6 +166,8 @@ impl Plot {
             fh,
             path: file_path,
             read_offset: 0,
+            align_offset: 0,
+            seek_base: 0,
             use_direct_io,
             sector_size,
             dummy,
@@ -173,6 +177,7 @@ impl Plot {
 #[cfg(not(feature = "async_io"))]
 pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         self.read_offset = 0;
+        self.align_offset = 0;
         let nonces = self.meta.nonces;
         let mut seek_addr = u64::from(scoop) * nonces as u64 * SCOOP_SIZE;
 
@@ -184,8 +189,9 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         };
 
         if self.use_direct_io {
-            self.read_offset = self.round_seek_addr(&mut seek_addr);
+            self.align_offset = self.round_seek_addr(&mut seek_addr);
         }
+        self.seek_base = seek_addr;
 
         self.fh.seek(SeekFrom::Start(seek_addr))
     }
@@ -193,6 +199,7 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
     #[cfg(feature = "async_io")]
     pub async fn prepare_async(&mut self, scoop: u32) -> io::Result<u64> {
         self.read_offset = 0;
+        self.align_offset = 0;
         let nonces = self.meta.nonces;
         let mut seek_addr = u64::from(scoop) * nonces as u64 * SCOOP_SIZE;
 
@@ -205,8 +212,9 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         };
 
         if self.use_direct_io {
-            self.read_offset = self.round_seek_addr(&mut seek_addr);
+            self.align_offset = self.round_seek_addr(&mut seek_addr);
         }
+        self.seek_base = seek_addr;
 
         self.fh.seek(SeekFrom::Start(seek_addr)).await
     }
@@ -234,9 +242,7 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
             };
 
         let offset = self.read_offset;
-        let nonces = self.meta.nonces;
-        let seek_addr =
-            SeekFrom::Start(offset as u64 + u64::from(scoop) * nonces as u64 * SCOOP_SIZE);
+        let seek_addr = SeekFrom::Start(self.seek_base + self.align_offset + offset);
         if !self.dummy {
             self.fh.seek(seek_addr)?;
             self.fh.read_exact(&mut bs[0..bytes_to_read])?;
@@ -280,9 +286,7 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         };
 
         let offset = self.read_offset;
-        let nonces = self.meta.nonces;
-        let seek_addr =
-            SeekFrom::Start(offset as u64 + u64::from(scoop) * nonces as u64 * SCOOP_SIZE);
+        let seek_addr = SeekFrom::Start(self.seek_base + self.align_offset + offset);
         if !self.dummy {
             self.fh.seek(seek_addr).await?;
             self.fh.read_exact(&mut bs[0..bytes_to_read]).await?;
@@ -325,13 +329,17 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
     }
 
     fn round_seek_addr(&mut self, seek_addr: &mut u64) -> u64 {
+        // Align file offset to the underlying sector size without skipping
+        // the beginning of the scoop.  Older logic aligned upwards which
+        // resulted in bytes at the start of a scoop being silently ignored
+        // when using direct I/O.  This caused nonce calculation to be off by
+        // the alignment delta when `async_io` was enabled.  Aligning downwards
+        // preserves all bytes while still satisfying the O_DIRECT requirement.
+
         let r = *seek_addr % self.sector_size;
         if r != 0 {
-            let offset = self.sector_size - r;
-            *seek_addr += offset;
-            offset
-        } else {
-            0
+            *seek_addr -= r;
         }
+        r
     }
 }
