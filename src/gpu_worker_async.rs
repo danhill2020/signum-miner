@@ -52,11 +52,9 @@ pub fn create_gpu_worker_task_async(
                             account_id: read_reply.info.account_id,
                         })
                         .wait()
-                        .expect("GPU async worker failed to send nonce data");
+                        .ok(); // Handle channel close gracefully
                 }
-                tx_empty_buffers
-                    .send(buffer)
-                    .expect("GPU async worker failed to cue empty buffer");
+                let _ = tx_empty_buffers.send(buffer); // Handle channel close gracefully
                 continue;
             }
 
@@ -64,9 +62,7 @@ pub fn create_gpu_worker_task_async(
             if read_reply.info.gpu_signal == 1 {
                 if !new_round {
                     if let Ok(sink_buffer) = rx_sink.try_recv() {
-                        tx_empty_buffers
-                            .send(sink_buffer)
-                            .expect("GPU async worker failed to cue empty buffer from sink")
+                        let _ = tx_empty_buffers.send(sink_buffer); // Handle channel close gracefully
                     }
                 }
                 drive_count = 0;
@@ -87,23 +83,20 @@ pub fn create_gpu_worker_task_async(
                     let deadline = result.0;
                     let offset = result.1;
 
-                    tx_nonce_data
+                    let _ = tx_nonce_data
                         .clone()
                         .send(NonceData {
                             height: last_buffer_info_a.height,
                             block: last_buffer_info_a.block,
                             base_target: last_buffer_info_a.base_target,
                             deadline,
-                            nonce: offset + last_buffer_info_a.start_nonce,
+                            nonce: offset.saturating_add(last_buffer_info_a.start_nonce),
                             reader_task_processed: last_buffer_info_a.finished,
                             account_id: last_buffer_info_a.account_id,
                         })
-                        .wait()
-                        .expect("GPU async worker failed to send nonce data");
+                        .wait(); // Handle channel close gracefully
                     if let Ok(sink_buffer) = rx_sink.try_recv() {
-                        tx_empty_buffers
-                            .send(sink_buffer)
-                            .expect("GPU async worker failed to cue empty buffer from sink")
+                        let _ = tx_empty_buffers.send(sink_buffer); // Handle channel close gracefully
                     }
                 }
                 continue;
@@ -128,31 +121,26 @@ pub fn create_gpu_worker_task_async(
                 let deadline = result.0;
                 let offset = result.1;
 
-                tx_nonce_data
+                let _ = tx_nonce_data
                     .clone()
                     .send(NonceData {
                         height: last_buffer_info_a.height,
                         block: last_buffer_info_a.block,
                         base_target: last_buffer_info_a.base_target,
                         deadline,
-                        nonce: offset + last_buffer_info_a.start_nonce,
+                        nonce: offset.saturating_add(last_buffer_info_a.start_nonce),
                         reader_task_processed: last_buffer_info_a.finished,
                         account_id: last_buffer_info_a.account_id,
                     })
-                    .wait()
-                    .expect("GPU async worker failed to cue empty buffer");
+                    .wait(); // Handle channel close gracefully
                 if let Ok(sink_buffer) = rx_sink.try_recv() {
-                    tx_empty_buffers
-                        .send(sink_buffer)
-                        .expect("GPU async worker failed to cue empty buffer from sink")
+                    let _ = tx_empty_buffers.send(sink_buffer); // Handle channel close gracefully
                 }
             }
             last_buffer_a = buffer.get_gpu_data();
             last_buffer_info_a = read_reply.info;
             new_round = false;
-            tx_sink
-                .send(buffer)
-                .expect("GPU async worker failed to cue buffer in sink");
+            let _ = tx_sink.send(buffer); // Handle channel close gracefully
         }
     }
 }
