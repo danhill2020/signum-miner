@@ -59,7 +59,7 @@ pub fn create_gpu_worker_task(
                 block: read_reply.info.block,
                 base_target: read_reply.info.base_target,
                 deadline,
-                nonce: offset + read_reply.info.start_nonce,
+                nonce: offset.saturating_add(read_reply.info.start_nonce),
                 reader_task_processed: read_reply.info.finished,
                 account_id: read_reply.info.account_id,
             });

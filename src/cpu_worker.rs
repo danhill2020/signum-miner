@@ -133,7 +133,13 @@ pub fn hash(
 #[cfg(feature = "async_io")]
         let bs = bs.blocking_lock();
 #[cfg(not(feature = "async_io"))]
-        let bs = bs.lock().unwrap();
+        let bs = match bs.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("cpu_worker: buffer mutex poisoned, recovering...");
+                poisoned.into_inner()
+            }
+        };
 
         #[cfg(feature = "simd_avx512f")]
         unsafe {
@@ -226,7 +232,7 @@ pub fn hash(
             block: read_reply.info.block,
             base_target: read_reply.info.base_target,
             deadline,
-            nonce: offset + read_reply.info.start_nonce,
+            nonce: offset.saturating_add(read_reply.info.start_nonce),
             reader_task_processed: read_reply.info.finished,
             account_id: read_reply.info.account_id,
         });
