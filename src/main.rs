@@ -13,6 +13,7 @@ mod config;
 mod cpu_worker;
 mod future;
 mod logger;
+mod metrics;
 mod miner;
 mod plot;
 mod poc_hashing;
@@ -141,7 +142,14 @@ async fn main() {
         .map(|s| s.as_str())
         .unwrap_or("config.yaml");
 
-    let cfg_loaded = load_cfg(config);
+    let cfg_loaded = match load_cfg(config) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("❌ Configuration Error: {}", e);
+            eprintln!("\nPlease create a valid config.yaml file or specify a different config file with --config");
+            std::process::exit(1);
+        }
+    };
     logger::init_logger(&cfg_loaded);
 
     info!(

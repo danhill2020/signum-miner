@@ -99,22 +99,22 @@ impl Reader {
         // send start signals (dummy buffer) to gpu threads
         #[cfg(feature = "opencl")]
         for i in 0..self.tx_read_replies_gpu.as_ref().unwrap().len() {
-            self.tx_read_replies_gpu.as_ref().unwrap()[i]
-                .send(ReadReply {
-                    buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
-                    info: BufferInfo {
-                        len: 1,
-                        height,
-                        block,
-                        base_target,
-                        gensig: gensig.clone(),
-                        start_nonce: 0,
-                        finished: false,
-                        account_id: 0,
-                        gpu_signal: 1,
-                    },
-                })
-                .expect("Error sending 'round start' signal to GPU");
+            if let Err(e) = self.tx_read_replies_gpu.as_ref().unwrap()[i].send(ReadReply {
+                buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
+                info: BufferInfo {
+                    len: 1,
+                    height,
+                    block,
+                    base_target,
+                    gensig: gensig.clone(),
+                    start_nonce: 0,
+                    finished: false,
+                    account_id: 0,
+                    gpu_signal: 1,
+                },
+            }) {
+                error!("reader: failed to send 'round start' signal to GPU thread: {}", e);
+            }
         }
 
         self.interupts = self
@@ -160,7 +160,13 @@ impl Reader {
 #[cfg(feature = "async_io")]
                 let mut p = plots[0].blocking_lock();
 #[cfg(not(feature = "async_io"))]
-                let mut p = plots[0].lock().unwrap();
+                let mut p = match plots[0].lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        error!("wakeup: mutex poisoned, recovering...");
+                        poisoned.into_inner()
+                    }
+                };
 
                 if let Err(e) = p.seek_random() {
                     error!(
@@ -211,7 +217,13 @@ impl Reader {
             let mut nonces_processed = 0u64;
             let plot_count = plots.len();
             'outer: for (i_p, p) in plots.iter().enumerate() {
-                let mut p = p.lock().unwrap();
+                let mut p = match p.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        error!("reader: mutex poisoned for plot, recovering...");
+                        poisoned.into_inner()
+                    }
+                };
                 if let Err(e) = p.prepare(scoop) {
                     error!(
                         "reader: error preparing {} for reading: {} -> skip one round",
@@ -225,7 +237,13 @@ impl Reader {
                         sw.restart();
                     }
                     let mut_bs = buffer.get_buffer_for_writing();
-                    let mut bs = mut_bs.lock().unwrap();
+                    let mut bs = match mut_bs.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => {
+                            error!("reader: buffer mutex poisoned, recovering...");
+                            poisoned.into_inner()
+                        }
+                    };
                     let (bytes_read, start_nonce, next_plot) = match p.read(&mut bs, scoop) {
                         Ok(x) => x,
                         Err(e) => {
@@ -240,7 +258,9 @@ impl Reader {
 
                     if rx_interupt.try_recv().is_ok() {
                         buffer.unmap();
-                        tx_empty_buffers.send(buffer).unwrap();
+                        if let Err(e) = tx_empty_buffers.send(buffer) {
+                            error!("reader: failed to return buffer to pool: {} -> stopping", e);
+                        }
                         break 'outer;
                     }
 
@@ -249,66 +269,75 @@ impl Reader {
                     #[cfg(feature = "opencl")]
                     match buffer.get_id() {
                         0 => {
-                            tx_read_replies_cpu
-                                .send(ReadReply {
-                                    buffer,
-                                    info: BufferInfo {
-                                        len: bytes_read,
-                                        height,
-                                        block,
-                                        base_target,
-                                        gensig: gensig.clone(),
-                                        start_nonce,
-                                        finished,
-                                        account_id: p.meta.account_id,
-                                        gpu_signal: 0,
-                                    },
-                                })
-                                .expect("failed to send read data to CPU thread");
+                            if let Err(e) = tx_read_replies_cpu.send(ReadReply {
+                                buffer,
+                                info: BufferInfo {
+                                    len: bytes_read,
+                                    height,
+                                    block,
+                                    base_target,
+                                    gensig: gensig.clone(),
+                                    start_nonce,
+                                    finished,
+                                    account_id: p.meta.account_id,
+                                    gpu_signal: 0,
+                                },
+                            }) {
+                                error!("reader: failed to send read data to CPU thread: {} -> stopping", e);
+                                break 'outer;
+                            }
                         }
                         i => {
-                            tx_read_replies_gpu.as_ref().unwrap()[i - 1]
-                                .send(ReadReply {
-                                    buffer,
-                                    info: BufferInfo {
-                                        len: bytes_read,
-                                        height,
-                                        block,
-                                        base_target,
-                                        gensig: gensig.clone(),
-                                        start_nonce,
-                                        finished,
-                                        account_id: p.meta.account_id,
-                                        gpu_signal: 0,
-                                    },
-                                })
-                                .expect("failed to send read data to GPU thread A");
+                            if let Err(e) = tx_read_replies_gpu.as_ref().unwrap()[i - 1].send(ReadReply {
+                                buffer,
+                                info: BufferInfo {
+                                    len: bytes_read,
+                                    height,
+                                    block,
+                                    base_target,
+                                    gensig: gensig.clone(),
+                                    start_nonce,
+                                    finished,
+                                    account_id: p.meta.account_id,
+                                    gpu_signal: 0,
+                                },
+                            }) {
+                                error!("reader: failed to send read data to GPU thread: {} -> stopping", e);
+                                break 'outer;
+                            }
                         }
                     }
                     #[cfg(not(feature = "opencl"))]
-                    tx_read_replies_cpu
-                        .send(ReadReply {
-                            buffer,
-                            info: BufferInfo {
-                                len: bytes_read,
-                                height,
-                                block,
-                                base_target,
-                                gensig: gensig.clone(),
-                                start_nonce,
-                                finished,
-                                account_id: p.meta.account_id,
-                                gpu_signal: 0,
-                            },
-                        })
-                        .unwrap();
+                    if let Err(e) = tx_read_replies_cpu.send(ReadReply {
+                        buffer,
+                        info: BufferInfo {
+                            len: bytes_read,
+                            height,
+                            block,
+                            base_target,
+                            gensig: gensig.clone(),
+                            start_nonce,
+                            finished,
+                            account_id: p.meta.account_id,
+                            gpu_signal: 0,
+                        },
+                    }) {
+                        error!("reader: failed to send read data to CPU thread: {} -> stopping", e);
+                        break 'outer;
+                    }
 
                     nonces_processed += bytes_read as u64 / 64;
 
                     match &pb {
                         Some(pb) => {
-                            let mut pb = pb.lock().unwrap();
-                            pb.add(bytes_read as u64);
+                            match pb.lock() {
+                                Ok(mut pb) => pb.add(bytes_read as u64),
+                                Err(poisoned) => {
+                                    error!("reader: progress bar mutex poisoned, recovering...");
+                                    let mut pb = poisoned.into_inner();
+                                    pb.add(bytes_read as u64);
+                                }
+                            }
                         }
                         None => (),
                     }
@@ -321,22 +350,22 @@ impl Reader {
                     if finished {
                         #[cfg(feature = "opencl")]
                         for i in 0..tx_read_replies_gpu.as_ref().unwrap().len() {
-                            tx_read_replies_gpu.as_ref().unwrap()[i]
-                                .send(ReadReply {
-                                    buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
-                                    info: BufferInfo {
-                                        len: 1,
-                                        height,
-                                        block,
-                                        base_target,
-                                        gensig: gensig.clone(),
-                                        start_nonce: 0,
-                                        finished: false,
-                                        account_id: 0,
-                                        gpu_signal: 2,
-                                    },
-                                })
-                                .expect("Error sending 'drive finished' signal to GPU thread A");
+                            if let Err(e) = tx_read_replies_gpu.as_ref().unwrap()[i].send(ReadReply {
+                                buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
+                                info: BufferInfo {
+                                    len: 1,
+                                    height,
+                                    block,
+                                    base_target,
+                                    gensig: gensig.clone(),
+                                    start_nonce: 0,
+                                    finished: false,
+                                    account_id: 0,
+                                    gpu_signal: 2,
+                                },
+                            }) {
+                                error!("reader: failed to send 'drive finished' signal to GPU thread: {}", e);
+                            }
                         }
                     }
 
@@ -423,7 +452,9 @@ impl Reader {
 
                         if rx_interupt.try_recv().is_ok() {
                             buffer.unmap();
-                            tx_empty_buffers.send(buffer).unwrap();
+                            if let Err(e) = tx_empty_buffers.send(buffer) {
+                                error!("reader: failed to return buffer to pool (async): {} -> stopping", e);
+                            }
                             break 'outer;
                         }
 
@@ -431,59 +462,62 @@ impl Reader {
                         #[cfg(feature = "opencl")]
                         match buffer.get_id() {
                             0 => {
-                                tx_read_replies_cpu
-                                    .send(ReadReply {
-                                        buffer,
-                                        info: BufferInfo {
-                                            len: bytes_read,
-                                            height,
-                                            block,
-                                            base_target,
-                                            gensig: gensig.clone(),
-                                            start_nonce,
-                                            finished,
-                                            account_id: p.meta.account_id,
-                                            gpu_signal: 0,
-                                        },
-                                    })
-                                    .expect("failed to send read data to CPU thread");
+                                if let Err(e) = tx_read_replies_cpu.send(ReadReply {
+                                    buffer,
+                                    info: BufferInfo {
+                                        len: bytes_read,
+                                        height,
+                                        block,
+                                        base_target,
+                                        gensig: gensig.clone(),
+                                        start_nonce,
+                                        finished,
+                                        account_id: p.meta.account_id,
+                                        gpu_signal: 0,
+                                    },
+                                }) {
+                                    error!("reader: failed to send read data to CPU thread (async): {} -> stopping", e);
+                                    break 'outer;
+                                }
                             }
                             i => {
-                                tx_read_replies_gpu.as_ref().unwrap()[i - 1]
-                                    .send(ReadReply {
-                                        buffer,
-                                        info: BufferInfo {
-                                            len: bytes_read,
-                                            height,
-                                            block,
-                                            base_target,
-                                            gensig: gensig.clone(),
-                                            start_nonce,
-                                            finished,
-                                            account_id: p.meta.account_id,
-                                            gpu_signal: 0,
-                                        },
-                                    })
-                                    .expect("failed to send read data to GPU thread A");
+                                if let Err(e) = tx_read_replies_gpu.as_ref().unwrap()[i - 1].send(ReadReply {
+                                    buffer,
+                                    info: BufferInfo {
+                                        len: bytes_read,
+                                        height,
+                                        block,
+                                        base_target,
+                                        gensig: gensig.clone(),
+                                        start_nonce,
+                                        finished,
+                                        account_id: p.meta.account_id,
+                                        gpu_signal: 0,
+                                    },
+                                }) {
+                                    error!("reader: failed to send read data to GPU thread (async): {} -> stopping", e);
+                                    break 'outer;
+                                }
                             }
                         }
                         #[cfg(not(feature = "opencl"))]
-                        tx_read_replies_cpu
-                            .send(ReadReply {
-                                buffer,
-                                info: BufferInfo {
-                                    len: bytes_read,
-                                    height,
-                                    block,
-                                    base_target,
-                                    gensig: gensig.clone(),
-                                    start_nonce,
-                                    finished,
-                                    account_id: p.meta.account_id,
-                                    gpu_signal: 0,
-                                },
-                            })
-                            .unwrap();
+                        if let Err(e) = tx_read_replies_cpu.send(ReadReply {
+                            buffer,
+                            info: BufferInfo {
+                                len: bytes_read,
+                                height,
+                                block,
+                                base_target,
+                                gensig: gensig.clone(),
+                                start_nonce,
+                                finished,
+                                account_id: p.meta.account_id,
+                                gpu_signal: 0,
+                            },
+                        }) {
+                            error!("reader: failed to send read data to CPU thread (async): {} -> stopping", e);
+                            break 'outer;
+                        }
 
                         nonces_processed += bytes_read as u64 / 64;
 
@@ -505,22 +539,22 @@ impl Reader {
                         if finished {
                             #[cfg(feature = "opencl")]
                             for i in 0..tx_read_replies_gpu.as_ref().unwrap().len() {
-                                tx_read_replies_gpu.as_ref().unwrap()[i]
-                                    .send(ReadReply {
-                                        buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
-                                        info: BufferInfo {
-                                            len: 1,
-                                            height,
-                                            block,
-                                            base_target,
-                                            gensig: gensig.clone(),
-                                            start_nonce: 0,
-                                            finished: false,
-                                            account_id: 0,
-                                            gpu_signal: 2,
-                                        },
-                                    })
-                                    .expect("Error sending 'drive finished' signal to GPU thread A");
+                                if let Err(e) = tx_read_replies_gpu.as_ref().unwrap()[i].send(ReadReply {
+                                    buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
+                                    info: BufferInfo {
+                                        len: 1,
+                                        height,
+                                        block,
+                                        base_target,
+                                        gensig: gensig.clone(),
+                                        start_nonce: 0,
+                                        finished: false,
+                                        account_id: 0,
+                                        gpu_signal: 2,
+                                    },
+                                }) {
+                                    error!("reader: failed to send 'drive finished' signal to GPU thread (async): {}", e);
+                                }
                             }
                         }
 
@@ -552,14 +586,20 @@ pub fn check_overlap(drive_id_to_plots: &HashMap<String, Arc<Vec<Mutex<Plot>>>>)
         .values()
         .map(|a| a.iter())
         .flatten()
-        .map(|plot| {
+        .filter_map(|plot| {
             #[cfg(feature = "async_io")]
             {
-                plot.blocking_lock().meta.clone()
+                Some(plot.blocking_lock().meta.clone())
             }
             #[cfg(not(feature = "async_io"))]
             {
-                plot.lock().unwrap().meta.clone()
+                match plot.lock() {
+                    Ok(guard) => Some(guard.meta.clone()),
+                    Err(poisoned) => {
+                        error!("check_overlap: mutex poisoned, recovering...");
+                        Some(poisoned.into_inner().meta.clone())
+                    }
+                }
             }
         })
         .collect();

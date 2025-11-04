@@ -10,6 +10,7 @@ use crate::gpu_worker_async::create_gpu_worker_task_async;
 use crate::ocl::GpuBuffer;
 #[cfg(feature = "opencl")]
 use crate::ocl::GpuContext;
+use crate::metrics::{SharedMetrics, SharedDiskHealth, new_shared_metrics, new_shared_disk_health};
 use crate::plot::{Plot, SCOOP_SIZE};
 use crate::poc_hashing;
 use crate::reader::Reader;
@@ -57,6 +58,8 @@ pub struct Miner {
     executor: Handle,
     wakeup_after: i64,
     submit_only_best: bool,
+    metrics: SharedMetrics,
+    disk_health: SharedDiskHealth,
 }
 
 pub struct State {
@@ -242,7 +245,13 @@ fn scan_plots(
                 #[cfg(feature = "async_io")]
                 let p = p.blocking_lock();
                 #[cfg(not(feature = "async_io"))]
-                let p = p.lock().unwrap();
+                let p = match p.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        warn!("scan_plots: mutex poisoned, recovering...");
+                        poisoned.into_inner()
+                    }
+                };
                 match std::fs::metadata(&p.path) {
                     Ok(m) => -FileTime::from_last_modification_time(&m).unix_seconds(),
                     Err(e) => {
@@ -459,6 +468,9 @@ impl Miner {
         #[cfg(not(feature = "opencl"))]
         let tx_read_replies_gpu = None;
 
+        let metrics = new_shared_metrics();
+        let disk_health = new_shared_disk_health();
+
         Miner {
             plot_dirs: cfg.plot_dirs.clone(),
             hdd_use_direct_io: cfg.hdd_use_direct_io,
@@ -496,6 +508,8 @@ impl Miner {
             executor,
             wakeup_after: cfg.hdd_wakeup_after * 1000, // ms -> s
             submit_only_best : cfg.submit_only_best,
+            metrics,
+            disk_health,
         }
     }
 
@@ -506,7 +520,13 @@ impl Miner {
         #[cfg(feature = "async_io")]
         let mut reader = self.reader.lock().await;
         #[cfg(not(feature = "async_io"))]
-        let mut reader = self.reader.lock().unwrap();
+        let mut reader = match self.reader.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                error!("refresh_capacity: reader mutex poisoned, recovering...");
+                poisoned.into_inner()
+            }
+        };
         let old_size = reader.total_size;
         reader.update_plots(drive_id_to_plots, total_size, self.benchmark_cpu);
         drop(reader);
@@ -519,7 +539,13 @@ impl Miner {
         }
         #[cfg(not(feature = "async_io"))]
         {
-            let mut rh = self.request_handler.lock().unwrap();
+            let mut rh = match self.request_handler.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    error!("refresh_capacity: request_handler mutex poisoned, recovering...");
+                    poisoned.into_inner()
+                }
+            };
             rh.update_capacity(total_size_gb);
         }
 
@@ -547,7 +573,15 @@ impl Miner {
         #[cfg(feature = "async_io")]
         let total_size = { miner.reader.lock().await.total_size };
         #[cfg(not(feature = "async_io"))]
-        let total_size = { miner.reader.lock().unwrap().total_size };
+        let total_size = {
+            match miner.reader.lock() {
+                Ok(reader) => reader.total_size,
+                Err(poisoned) => {
+                    error!("run: reader mutex poisoned during init, recovering...");
+                    poisoned.into_inner().total_size
+                }
+            }
+        };
 
         let reader = miner.reader.clone();
 
@@ -571,7 +605,13 @@ impl Miner {
                         };
                         #[cfg(not(feature = "async_io"))]
                         let mining_info_fut = {
-                            let rh = request_handler.lock().unwrap().clone();
+                            let rh = match request_handler.lock() {
+                                Ok(guard) => guard.clone(),
+                                Err(poisoned) => {
+                                    error!("run: request_handler mutex poisoned in mining info task, recovering...");
+                                    poisoned.into_inner().clone()
+                                }
+                            };
                             async move { rh.get_mining_info().await }
                         };
                         match mining_info_fut.await {
@@ -579,7 +619,13 @@ impl Miner {
                                 #[cfg(feature = "async_io")]
                                 let mut state = state.lock().await;
                                 #[cfg(not(feature = "async_io"))]
-                                let mut state = state.lock().unwrap();
+                                let mut state = match state.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => {
+                                        error!("run: state mutex poisoned in mining info task, recovering...");
+                                        poisoned.into_inner()
+                                    }
+                                };
                                 state.first = false;
                                 if state.outage {
                                     error!("{: <80}", "outage resolved.");
@@ -596,13 +642,25 @@ impl Miner {
                                         &Arc::new(state.generation_signature_bytes),
                                     );
                                     #[cfg(not(feature = "async_io"))]
-                                    reader.lock().unwrap().start_reading(
-                                        mining_info.height,
-                                        state.block,
-                                        mining_info.base_target,
-                                        state.scoop,
-                                        &Arc::new(state.generation_signature_bytes),
-                                    );
+                                    match reader.lock() {
+                                        Ok(mut reader) => reader.start_reading(
+                                            mining_info.height,
+                                            state.block,
+                                            mining_info.base_target,
+                                            state.scoop,
+                                            &Arc::new(state.generation_signature_bytes),
+                                        ),
+                                        Err(poisoned) => {
+                                            error!("run: reader mutex poisoned during start_reading, recovering...");
+                                            poisoned.into_inner().start_reading(
+                                                mining_info.height,
+                                                state.block,
+                                                mining_info.base_target,
+                                                state.scoop,
+                                                &Arc::new(state.generation_signature_bytes),
+                                            );
+                                        }
+                                    }
                                     drop(state);
                                 } else if !state.scanning
                                     && wakeup_after != 0
@@ -612,15 +670,43 @@ impl Miner {
                                     #[cfg(feature = "async_io")]
                                     reader.lock().await.wakeup();
                                     #[cfg(not(feature = "async_io"))]
-                                    reader.lock().unwrap().wakeup();
+                                    match reader.lock() {
+                                        Ok(mut reader) => reader.wakeup(),
+                                        Err(poisoned) => {
+                                            error!("run: reader mutex poisoned during wakeup, recovering...");
+                                            poisoned.into_inner().wakeup();
+                                        }
+                                    }
                                     state.sw.restart();
                                 }
                             }
                             _ => {
+                                // Record network error
+                                let miner_ref = miner.clone();
+                                tokio::spawn(async move {
+                                    #[cfg(feature = "async_io")]
+                                    let mut metrics = miner_ref.metrics.write().await;
+                                    #[cfg(not(feature = "async_io"))]
+                                    let mut metrics = match miner_ref.metrics.write() {
+                                        Ok(guard) => guard,
+                                        Err(poisoned) => {
+                                            error!("metrics: mutex poisoned during network error, recovering...");
+                                            poisoned.into_inner()
+                                        }
+                                    };
+                                    metrics.record_network_error();
+                                });
+
                                 #[cfg(feature = "async_io")]
                                 let mut state = state.lock().await;
                                 #[cfg(not(feature = "async_io"))]
-                                let mut state = state.lock().unwrap();
+                                let mut state = match state.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poisoned) => {
+                                        error!("run: state mutex poisoned in error handler, recovering...");
+                                        poisoned.into_inner()
+                                    }
+                                };
                                 if state.first {
                                     error!(
                                         "{: <80}",
@@ -654,6 +740,47 @@ impl Miner {
                 .await;
         });
 
+        // Metrics reporting task (every 5 minutes)
+        let miner_metrics = miner.clone();
+        tokio::spawn(async move {
+            Interval::new_interval(Duration::from_secs(300))
+                .for_each(move |_| {
+                    let miner_metrics = miner_metrics.clone();
+                    async move {
+                        #[cfg(feature = "async_io")]
+                        let metrics = miner_metrics.metrics.read().await;
+                        #[cfg(not(feature = "async_io"))]
+                        let metrics = match miner_metrics.metrics.read() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => {
+                                error!("metrics reporting: mutex poisoned, recovering...");
+                                poisoned.into_inner()
+                            }
+                        };
+
+                        info!("\n{}", metrics.summary());
+
+                        #[cfg(feature = "async_io")]
+                        let disk_health = miner_metrics.disk_health.read().await;
+                        #[cfg(not(feature = "async_io"))]
+                        let disk_health = match miner_metrics.disk_health.read() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => {
+                                error!("disk health reporting: mutex poisoned, recovering...");
+                                poisoned.into_inner()
+                            }
+                        };
+
+                        if disk_health.has_unhealthy_drives() {
+                            warn!("\n{}", disk_health.health_summary());
+                        } else {
+                            info!("\n{}", disk_health.health_summary());
+                        }
+                    }
+                })
+                .await;
+        });
+
         // only start submitting nonces after a while
         let mut best_nonce_data = NonceData {
             height: 0,
@@ -681,7 +808,13 @@ impl Miner {
                         #[cfg(feature = "async_io")]
                         let mut state = state.lock().await;
                         #[cfg(not(feature = "async_io"))]
-                        let mut state = state.lock().unwrap();
+                        let mut state = match state.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => {
+                                error!("run: state mutex poisoned in nonce processing task, recovering...");
+                                poisoned.into_inner()
+                            }
+                        };
 
                         let deadline = nonce_data.deadline / nonce_data.base_target;
                         if state.height == nonce_data.height {
@@ -716,32 +849,63 @@ impl Miner {
                                         state.generation_signature_bytes,
                                     );
                                     #[cfg(not(feature = "async_io"))]
-                                    request_handler.lock().unwrap().submit_nonce(
-                                        nonce_data.account_id,
-                                        nonce_data.nonce,
-                                        nonce_data.height,
-                                        nonce_data.block,
-                                        nonce_data.deadline,
-                                        deadline,
-                                        state.generation_signature_bytes,
-                                    );
+                                    match request_handler.lock() {
+                                        Ok(mut rh) => rh.submit_nonce(
+                                            nonce_data.account_id,
+                                            nonce_data.nonce,
+                                            nonce_data.height,
+                                            nonce_data.block,
+                                            nonce_data.deadline,
+                                            deadline,
+                                            state.generation_signature_bytes,
+                                        ),
+                                        Err(poisoned) => {
+                                            error!("run: request_handler mutex poisoned during nonce submit, recovering...");
+                                            poisoned.into_inner().submit_nonce(
+                                                nonce_data.account_id,
+                                                nonce_data.nonce,
+                                                nonce_data.height,
+                                                nonce_data.block,
+                                                nonce_data.deadline,
+                                                deadline,
+                                                state.generation_signature_bytes,
+                                            );
+                                        }
+                                    }
                                 }
                             }
 
                             if nonce_data.reader_task_processed {
                                 state.processed_reader_tasks += 1;
                                 if state.processed_reader_tasks == reader_task_count {
+                                    let round_time_ms = state.sw.elapsed_ms();
+                                    let speed_mibs = total_size as f64 * 1000.0 / 1024.0 / 1024.0 / round_time_ms as f64;
+
                                     info!(
                                         "{: <80}",
                                         format!(
                                             "round finished: roundtime={}ms, speed={:.2}MiB/s",
-                                            state.sw.elapsed_ms(),
-                                            total_size as f64 * 1000.0
-                                                / 1024.0
-                                                / 1024.0
-                                                / state.sw.elapsed_ms() as f64
+                                            round_time_ms, speed_mibs
                                         )
                                     );
+
+                                    // Record metrics for completed round
+                                    let miner_ref = miner.clone();
+                                    let bytes_read = total_size;
+                                    tokio::spawn(async move {
+                                        #[cfg(feature = "async_io")]
+                                        let mut metrics = miner_ref.metrics.write().await;
+                                        #[cfg(not(feature = "async_io"))]
+                                        let mut metrics = match miner_ref.metrics.write() {
+                                            Ok(guard) => guard,
+                                            Err(poisoned) => {
+                                                error!("metrics: mutex poisoned during round completion, recovering...");
+                                                poisoned.into_inner()
+                                            }
+                                        };
+                                        metrics.record_round_complete(round_time_ms);
+                                        metrics.record_bytes_read(bytes_read);
+                                    });
 
                                     // Submit now our best one, if configured that way
                                     if best_nonce_data.height == state.height {
@@ -758,15 +922,29 @@ impl Miner {
                                             state.generation_signature_bytes,
                                         );
                                         #[cfg(not(feature = "async_io"))]
-                                        request_handler.lock().unwrap().submit_nonce(
-                                            best_nonce_data.account_id,
-                                            best_nonce_data.nonce,
-                                            best_nonce_data.height,
-                                            best_nonce_data.block,
-                                            best_nonce_data.deadline,
-                                            deadline,
-                                            state.generation_signature_bytes,
-                                        );
+                                        match request_handler.lock() {
+                                            Ok(mut rh) => rh.submit_nonce(
+                                                best_nonce_data.account_id,
+                                                best_nonce_data.nonce,
+                                                best_nonce_data.height,
+                                                best_nonce_data.block,
+                                                best_nonce_data.deadline,
+                                                deadline,
+                                                state.generation_signature_bytes,
+                                            ),
+                                            Err(poisoned) => {
+                                                error!("run: request_handler mutex poisoned during best nonce submit, recovering...");
+                                                poisoned.into_inner().submit_nonce(
+                                                    best_nonce_data.account_id,
+                                                    best_nonce_data.nonce,
+                                                    best_nonce_data.height,
+                                                    best_nonce_data.block,
+                                                    best_nonce_data.deadline,
+                                                    deadline,
+                                                    state.generation_signature_bytes,
+                                                );
+                                            }
+                                        }
                                     }
 
                                     state.sw.restart();
