@@ -7,3 +7,8 @@
 **/*.bat
 config-test.yaml
 Cargo.lock
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
