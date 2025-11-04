@@ -248,13 +248,6 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         if !self.dummy {
             self.fh.seek(seek_addr)?;
             self.fh.read_exact(&mut bs[0..bytes_to_read])?;
-            // interrupt avoider (not implemented)
-            // let read_chunk_size_in_nonces = 65536;
-            // for i in (0..bytes_to_read).step_by(read_chunk_size_in_nonces) {
-            //     self.fh.read_exact(
-            //         &mut bs[i..(i + min(read_chunk_size_in_nonces, bytes_to_read - i))],
-            //     )?;
-            // }
         }
         self.read_offset += bytes_to_read as u64;
 
@@ -332,14 +325,22 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         f.seek(SeekFrom::Start(seek_addr))
     }
 
+    /// Aligns the seek address for direct I/O operations.
+    ///
+    /// When using direct I/O (O_DIRECT), all file operations must be aligned to the
+    /// underlying device's sector size. This function aligns the seek address downward
+    /// to the nearest sector boundary and returns the alignment offset.
+    ///
+    /// # Arguments
+    /// * `seek_addr` - Mutable reference to the seek address to be aligned (modified in place)
+    ///
+    /// # Returns
+    /// The alignment offset (number of bytes the address was adjusted)
+    ///
+    /// # Note
+    /// This function aligns downward (not upward) to ensure no bytes at the beginning
+    /// of a scoop are skipped, which would cause incorrect nonce calculations.
     fn round_seek_addr(&mut self, seek_addr: &mut u64) -> u64 {
-        // Align file offset to the underlying sector size without skipping
-        // the beginning of the scoop.  Older logic aligned upwards which
-        // resulted in bytes at the start of a scoop being silently ignored
-        // when using direct I/O.  This caused nonce calculation to be off by
-        // the alignment delta when `async_io` was enabled.  Aligning downwards
-        // preserves all bytes while still satisfying the O_DIRECT requirement.
-
         let r = *seek_addr % self.sector_size;
         if r != 0 {
             *seek_addr -= r;

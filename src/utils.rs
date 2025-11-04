@@ -16,7 +16,7 @@ pub fn new_thread_pool(num_threads: usize, thread_pinning: bool) -> rayon::Threa
                 #[cfg(not(windows))]
                 core_affinity::set_for_current(core_id);
                 #[cfg(windows)]
-                set_thread_ideal_processor(id % core_ids.len());
+                let _ = set_thread_ideal_processor(id % core_ids.len());
             }
         })
         .build()
@@ -191,14 +191,23 @@ cfg_if! {
             .to_string()
         }
 
-        pub fn set_thread_ideal_processor(id: usize){
-            // Set core affinity for current thread.
-        unsafe {
-            SetThreadIdealProcessor(
-                GetCurrentThread(),
-                id as u32
-            );
+        /// Sets the ideal processor for the current thread on Windows.
+        /// Returns true on success, false on failure.
+        pub fn set_thread_ideal_processor(id: usize) -> bool {
+            unsafe {
+                // SetThreadIdealProcessor returns the previous ideal processor,
+                // or -1 (0xFFFFFFFF) on error
+                let result = SetThreadIdealProcessor(
+                    GetCurrentThread(),
+                    id as u32
+                );
 
+                if result == 0xFFFFFFFF {
+                    warn!("Failed to set ideal processor for thread to core {}", id);
+                    false
+                } else {
+                    true
+                }
             }
         }
     }

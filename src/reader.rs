@@ -1,6 +1,7 @@
 use crate::miner::Buffer;
 #[cfg(feature = "opencl")]
 use crate::miner::CpuBuffer;
+use crate::metrics::SharedDiskHealth;
 use crate::plot::{Meta, Plot};
 use crate::utils::new_thread_pool;
 use crossbeam_channel;
@@ -44,6 +45,7 @@ pub struct Reader {
     interupts: Vec<Sender<()>>,
     show_progress: bool,
     show_drive_stats: bool,
+    disk_health: SharedDiskHealth,
 }
 
 impl Reader {
@@ -59,6 +61,7 @@ impl Reader {
         show_drive_stats: bool,
         thread_pinning: bool,
         benchmark: bool,
+        disk_health: SharedDiskHealth,
     ) -> Reader {
         if !benchmark {
             check_overlap(&drive_id_to_plots);
@@ -75,9 +78,21 @@ impl Reader {
             interupts: Vec::new(),
             show_progress,
             show_drive_stats,
+            disk_health,
         }
     }
 
+    /// Starts reading plot files for a new mining round.
+    ///
+    /// Creates reader tasks for each drive, which read the specified scoop from all
+    /// plot files and send the data to worker threads for deadline calculation.
+    ///
+    /// # Arguments
+    /// * `height` - Current blockchain height
+    /// * `block` - Block number
+    /// * `base_target` - Network difficulty target
+    /// * `scoop` - Which scoop to read (0-4095) calculated from generation signature
+    /// * `gensig` - Generation signature for this round
     pub fn start_reading(
         &mut self,
         height: u64,
@@ -210,6 +225,7 @@ impl Reader {
         let tx_read_replies_cpu = self.tx_read_replies_cpu.clone();
         #[cfg(feature = "opencl")]
         let tx_read_replies_gpu = self.tx_read_replies_gpu.clone();
+        let disk_health = self.disk_health.clone();
 
         (tx_interupt, move || {
             let mut sw = Stopwatch::new();
@@ -229,6 +245,13 @@ impl Reader {
                         "reader: error preparing {} for reading: {} -> skip one round",
                         p.meta.name, e
                     );
+                    // Track I/O error in disk health monitor
+                    #[cfg(not(feature = "async_io"))]
+                    {
+                        if let Ok(mut health) = disk_health.write() {
+                            health.get_or_create(&drive).record_failure();
+                        }
+                    }
                     continue 'outer;
                 }
 
@@ -245,12 +268,28 @@ impl Reader {
                         }
                     };
                     let (bytes_read, start_nonce, next_plot) = match p.read(&mut bs, scoop) {
-                        Ok(x) => x,
+                        Ok(x) => {
+                            // Track successful read
+                            #[cfg(not(feature = "async_io"))]
+                            {
+                                if let Ok(mut health) = disk_health.write() {
+                                    health.get_or_create(&drive).record_success();
+                                }
+                            }
+                            x
+                        }
                         Err(e) => {
                             error!(
                                 "reader: error reading chunk from {}: {} -> skip one round",
                                 p.meta.name, e
                             );
+                            // Track I/O error in disk health monitor
+                            #[cfg(not(feature = "async_io"))]
+                            {
+                                if let Ok(mut health) = disk_health.write() {
+                                    health.get_or_create(&drive).record_failure();
+                                }
+                            }
                             buffer.unmap();
                             (0, 0, true)
                         }
@@ -407,6 +446,7 @@ impl Reader {
         let tx_read_replies_cpu = self.tx_read_replies_cpu.clone();
         #[cfg(feature = "opencl")]
         let tx_read_replies_gpu = self.tx_read_replies_gpu.clone();
+        let disk_health = self.disk_health.clone();
 
         (tx_interupt, move || {
             tokio::spawn(async move {
@@ -425,6 +465,12 @@ impl Reader {
                             p.meta.name,
                             e
                         );
+                        // Track I/O error in disk health monitor
+                        #[cfg(feature = "async_io")]
+                        {
+                            let mut health = disk_health.write().await;
+                            health.get_or_create(&drive).record_failure();
+                        }
                         continue 'outer;
                     }
 
@@ -438,13 +484,27 @@ impl Reader {
 #[cfg(not(feature = "async_io"))]
                         let mut bs = mut_bs.lock().unwrap();
                         let (bytes_read, start_nonce, next_plot) = match p.read_async(&mut bs, scoop).await {
-                            Ok(x) => x,
+                            Ok(x) => {
+                                // Track successful read
+                                #[cfg(feature = "async_io")]
+                                {
+                                    let mut health = disk_health.write().await;
+                                    health.get_or_create(&drive).record_success();
+                                }
+                                x
+                            }
                             Err(e) => {
                                 error!(
                                     "reader: error reading chunk from {}: {} -> skip one round",
                                     p.meta.name,
                                     e
                                 );
+                                // Track I/O error in disk health monitor
+                                #[cfg(feature = "async_io")]
+                                {
+                                    let mut health = disk_health.write().await;
+                                    health.get_or_create(&drive).record_failure();
+                                }
                                 buffer.unmap();
                                 (0, 0, true)
                             }

@@ -5,13 +5,13 @@ use futures_util::stream::{StreamExt};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 use url::Url;
 
 #[derive(Clone)]
 pub struct RequestHandler {
     client: Client,
-    tx_submit_data: mpsc::UnboundedSender<SubmissionParameters>,
+    tx_submit_data: mpsc::Sender<SubmissionParameters>,
 }
 
 impl RequestHandler {
@@ -39,7 +39,9 @@ impl RequestHandler {
             additional_headers,
         );
 
-        let (tx_submit_data, rx_submit_nonce_data) = mpsc::unbounded_channel();
+        // Use bounded channel to prevent memory exhaustion if submissions fail faster than processing
+        // Capacity of 1000 submissions should be sufficient for normal operation
+        let (tx_submit_data, rx_submit_nonce_data) = mpsc::channel(1000);
         RequestHandler::handle_submissions(
             client.clone(),
             rx_submit_nonce_data,
@@ -55,12 +57,12 @@ impl RequestHandler {
 
     fn handle_submissions(
         client: Client,
-        rx: mpsc::UnboundedReceiver<SubmissionParameters>,
-        tx_submit_data: mpsc::UnboundedSender<SubmissionParameters>,
+        rx: mpsc::Receiver<SubmissionParameters>,
+        tx_submit_data: mpsc::Sender<SubmissionParameters>,
         handle: tokio::runtime::Handle,
     ) {
         handle.spawn(async move {
-            let wrapped_rx = UnboundedReceiverStream::new(rx);
+            let wrapped_rx = ReceiverStream::new(rx);
             let stream = PrioRetry::new(wrapped_rx, Duration::from_secs(3));
 
             let mut stream = Box::pin(stream);
@@ -93,8 +95,8 @@ impl RequestHandler {
                                 submission_params.nonce,
                                 submission_params.deadline,
                             );
-                            if tx_submit_data.send(submission_params).is_err() {
-                                error!("can't send submission params");
+                            if tx_submit_data.send(submission_params).await.is_err() {
+                                error!("can't send submission params - channel closed");
                             }
                         } else {
                             log_submission_not_accepted(
@@ -114,8 +116,8 @@ impl RequestHandler {
                             submission_params.deadline,
                             &x.to_string(),
                         );
-                        if tx_submit_data.send(submission_params).is_err() {
-                            error!("can't send submission params");
+                        if tx_submit_data.send(submission_params).await.is_err() {
+                            error!("can't send submission params - channel closed");
                         }
                     }
                 }
@@ -137,7 +139,7 @@ impl RequestHandler {
         deadline: u64,
         gen_sig: [u8; 32],
     ) {
-        let res = self.tx_submit_data.send(SubmissionParameters {
+        let params = SubmissionParameters {
             account_id,
             nonce,
             height,
@@ -145,9 +147,14 @@ impl RequestHandler {
             deadline_unadjusted,
             deadline,
             gen_sig,
-        });
-        if let Err(e) = res {
-            error!("can't send submission params: {}", e);
+        };
+
+        // Use try_send to avoid blocking; if channel is full, log and drop submission
+        if let Err(e) = self.tx_submit_data.try_send(params) {
+            error!(
+                "can't send submission params: account={}, nonce={}, height={}, deadline={}, error={}",
+                account_id, nonce, height, deadline, e
+            );
         }
     }
 

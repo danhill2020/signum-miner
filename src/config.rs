@@ -291,6 +291,58 @@ pub fn validate_cfg(mut cfg: Cfg) -> Cfg {
         cfg.cpu_threads = cores;
     };
 
+    // Validate buffer sizes are reasonable (not too large or too small)
+    const MIN_BUFFER_SIZE: usize = 64 * 1024; // 64 KB
+    const MAX_BUFFER_SIZE: usize = 256 * 1024 * 1024; // 256 MB
+    if cfg.io_buffer_size < MIN_BUFFER_SIZE {
+        warn!(
+            "io_buffer_size ({}) is too small, using minimum {}",
+            cfg.io_buffer_size, MIN_BUFFER_SIZE
+        );
+        cfg.io_buffer_size = MIN_BUFFER_SIZE;
+    } else if cfg.io_buffer_size > MAX_BUFFER_SIZE {
+        warn!(
+            "io_buffer_size ({}) is too large, using maximum {}",
+            cfg.io_buffer_size, MAX_BUFFER_SIZE
+        );
+        cfg.io_buffer_size = MAX_BUFFER_SIZE;
+    }
+
+    // Validate timeout is reasonable
+    const MIN_TIMEOUT: u64 = 1000; // 1 second
+    const MAX_TIMEOUT: u64 = 300000; // 5 minutes
+    if cfg.timeout < MIN_TIMEOUT {
+        warn!(
+            "timeout ({}) is too short, using minimum {}ms",
+            cfg.timeout, MIN_TIMEOUT
+        );
+        cfg.timeout = MIN_TIMEOUT;
+    } else if cfg.timeout > MAX_TIMEOUT {
+        warn!(
+            "timeout ({}) is too long, using maximum {}ms",
+            cfg.timeout, MAX_TIMEOUT
+        );
+        cfg.timeout = MAX_TIMEOUT;
+    }
+
+    // Validate mining info interval
+    const MIN_INFO_INTERVAL: u64 = 1000; // 1 second
+    const MAX_INFO_INTERVAL: u64 = 60000; // 1 minute
+    if cfg.get_mining_info_interval < MIN_INFO_INTERVAL {
+        warn!(
+            "get_mining_info_interval ({}) is too short, using minimum {}ms",
+            cfg.get_mining_info_interval, MIN_INFO_INTERVAL
+        );
+        cfg.get_mining_info_interval = MIN_INFO_INTERVAL;
+    } else if cfg.get_mining_info_interval > MAX_INFO_INTERVAL {
+        warn!(
+            "get_mining_info_interval ({}) is too long, using maximum {}ms",
+            cfg.get_mining_info_interval, MAX_INFO_INTERVAL
+        );
+        cfg.get_mining_info_interval = MAX_INFO_INTERVAL;
+    }
+
+    // Validate plot directories
     cfg.plot_dirs = cfg
         .plot_dirs
         .iter()
@@ -307,6 +359,10 @@ pub fn validate_cfg(mut cfg: Cfg) -> Cfg {
             }
         })
         .collect();
+
+    if cfg.plot_dirs.is_empty() {
+        error!("No valid plot directories configured! Please check your config.yaml");
+    }
 
     cfg
 }

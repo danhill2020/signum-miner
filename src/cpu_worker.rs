@@ -94,6 +94,20 @@ pub fn create_cpu_worker_task(
     }
 }
 
+/// Processes a buffer of plot data to find the best deadline.
+///
+/// This function reads scoop data from plot files, calculates deadlines using
+/// SIMD-optimized hashing (AVX512F, AVX2, AVX, SSE2, or NEON depending on build),
+/// and sends the results back via channels.
+///
+/// # Arguments
+/// * `read_reply` - Contains the buffer with plot data and metadata
+/// * `tx_empty_buffers` - Channel to return the buffer for reuse
+/// * `tx_nonce_data` - Channel to send the computed nonce and deadline
+/// * `benchmark` - If true, skip actual hashing (for I/O benchmarking)
+///
+/// # Returns
+/// A closure that performs the hashing when executed
 pub fn hash(
     read_reply: ReadReply,
     tx_empty_buffers: Sender<Box<dyn Buffer + Send>>,
