@@ -259,17 +259,24 @@ fn default_submit_only_best() -> bool {
     true
 }
 
-pub fn load_cfg(config: &str) -> Cfg {
-    let cfg_str = fs::read_to_string(config).expect("failed to open config");
-    let cfg: Cfg = serde_yaml::from_str(&cfg_str).expect("failed to parse config");
+pub fn load_cfg(config: &str) -> Result<Cfg, String> {
+    let cfg_str = fs::read_to_string(config)
+        .map_err(|e| format!("Failed to open config file '{}': {}. Please check that the file exists and is readable.", config, e))?;
+
+    let cfg: Cfg = serde_yaml::from_str(&cfg_str)
+        .map_err(|e| format!("Failed to parse config file '{}': {}. Please check YAML syntax.", config, e))?;
+
     if cfg.hdd_use_direct_io {
         let cpu_nonces_per_cache = cfg.io_buffer_size / SCOOP_SIZE as usize;
-        assert!(
-            cpu_nonces_per_cache % 64 == 0 && cfg.gpu_nonces_per_cache % 64 == 0,
-            "nonces_per_cache should be divisible by 64 when using direct io"
-        );
+        if cpu_nonces_per_cache % 64 != 0 || cfg.gpu_nonces_per_cache % 64 != 0 {
+            return Err(format!(
+                "Configuration error: nonces_per_cache should be divisible by 64 when using direct I/O. \
+                Current values: io_buffer_size={} (results in {} nonces), gpu_nonces_per_cache={}",
+                cfg.io_buffer_size, cpu_nonces_per_cache, cfg.gpu_nonces_per_cache
+            ));
+        }
     }
-    validate_cfg(cfg)
+    Ok(validate_cfg(cfg))
 }
 
 pub fn validate_cfg(mut cfg: Cfg) -> Cfg {
@@ -332,7 +339,8 @@ mod tests {
         println!("YAML content:\n{}", contents);
         println!("Path to config: {:?}", config_path);
         // Konfiguration laden
-        let cfg = load_cfg(config_path.to_str().unwrap());
+        let cfg = load_cfg(config_path.to_str().unwrap())
+            .expect("Failed to load config in test");
 
         // Ausgabe für Debugging
         println!("cfg.plot_dirs = {:?}", cfg.plot_dirs);
