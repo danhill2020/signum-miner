@@ -110,11 +110,16 @@ impl Plot {
         if !path.is_file() {
             return Err(From::from(format!(
                 "{} is not a file",
-                path.to_str().unwrap()
+                path.to_str().unwrap_or("<non-UTF8 path>")
             )));
         }
 
-        let plot_file = path.file_name().unwrap().to_str().unwrap();
+        let plot_file = path.file_name()
+            .and_then(|f| f.to_str())
+            .ok_or_else(|| {
+                warn!("Plot file path contains invalid UTF-8: {:?}", path);
+                "Plot filename contains invalid UTF-8 characters"
+            })?;
         let parts: Vec<&str> = plot_file.split('_').collect();
         if parts.len() != 3 {
             return Err(From::from("plot file has wrong format"));
@@ -146,7 +151,11 @@ impl Plot {
         };
 
         let plot_file_name = plot_file.to_string();
-        let sector_size = get_sector_size(&path.to_str().unwrap().to_owned());
+        let sector_size = get_sector_size(&path.to_str()
+            .unwrap_or_else(|| {
+                warn!("Plot path contains invalid UTF-8, using lossy conversion: {:?}", path);
+                ""
+            }).to_owned());
         if use_direct_io && sector_size / 64 > nonces {
             warn!(
                 "not enough nonces for using direct io: plot={}",
@@ -155,7 +164,11 @@ impl Plot {
             use_direct_io = false;
         }
 
-        let file_path = path.clone().into_os_string().into_string().unwrap();
+        let file_path = path.clone().into_os_string().into_string()
+            .unwrap_or_else(|os_string| {
+                warn!("Plot file path contains invalid UTF-8, using lossy conversion: {:?}", os_string);
+                os_string.to_string_lossy().into_owned()
+            });
         Ok(Plot {
             meta: Meta {
                 account_id,

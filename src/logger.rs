@@ -45,7 +45,11 @@ pub fn init_logger(cfg: &Cfg) -> log4rs::Handle {
     let roller = FixedWindowRoller::builder()
         .base(1)
         .build("log/signum-miner.{}.log", cfg.logfile_max_count)
-        .unwrap();
+        .unwrap_or_else(|e| {
+            eprintln!("FATAL: Failed to build log roller: {}", e);
+            eprintln!("Please check that the 'log' directory exists and is writable");
+            std::process::exit(1);
+        });
     let trigger = SizeTrigger::new(&cfg.logfile_max_size * 1024 * 1024);
     let policy = Box::new(CompoundPolicy::new(Box::new(trigger), Box::new(roller)));
 
@@ -57,12 +61,22 @@ pub fn init_logger(cfg: &Cfg) -> log4rs::Handle {
                     .build("stdout", Box::new(stdout)),
             )
             .build(Root::builder().appender("stdout").build(LevelFilter::Info))
-            .unwrap()
+            .unwrap_or_else(|e| {
+                eprintln!("FATAL: Failed to build logger configuration: {}", e);
+                std::process::exit(1);
+            })
     } else {
         let logfile = RollingFileAppender::builder()
             .encoder(Box::new(PatternEncoder::new(&logfile_log_pattern)))
             .build("log/signum-miner.1.log", policy)
-            .unwrap();
+            .unwrap_or_else(|e| {
+                eprintln!("FATAL: Failed to create log file: {}", e);
+                eprintln!("Please check:");
+                eprintln!("  - 'log' directory exists and is writable");
+                eprintln!("  - Disk has sufficient space");
+                eprintln!("  - File permissions are correct");
+                std::process::exit(1);
+            });
         Config::builder()
             .appender(
                 Appender::builder()
@@ -80,9 +94,19 @@ pub fn init_logger(cfg: &Cfg) -> log4rs::Handle {
                     .appender("logfile")
                     .build(LevelFilter::Trace),
             )
-            .unwrap()
+            .unwrap_or_else(|e| {
+                eprintln!("FATAL: Failed to build logger configuration: {}", e);
+                std::process::exit(1);
+            })
     };
-    log4rs::init_config(config).unwrap()
+    log4rs::init_config(config).unwrap_or_else(|e| {
+        eprintln!("FATAL: Failed to initialize logger: {}", e);
+        eprintln!("Please check:");
+        eprintln!("  - Log directory exists and is writable");
+        eprintln!("  - Disk has sufficient space");
+        eprintln!("  - File permissions are correct");
+        std::process::exit(1);
+    })
 }
 
 #[cfg(test)]

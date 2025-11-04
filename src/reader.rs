@@ -415,10 +415,7 @@ impl Reader {
                 let mut nonces_processed = 0u64;
                 let plot_count = plots.len();
                 'outer: for (i_p, p) in plots.iter().enumerate() {
-#[cfg(feature = "async_io")]
                     let mut p = p.lock().await;
-#[cfg(not(feature = "async_io"))]
-                    let mut p = p.lock().unwrap();
                     if let Err(e) = p.prepare_async(scoop).await {
                         error!(
                             "reader: error preparing {} for reading: {} -> skip one round",
@@ -433,10 +430,7 @@ impl Reader {
                             sw.restart();
                         }
                         let mut_bs = buffer.get_buffer_for_writing();
-#[cfg(feature = "async_io")]
                         let mut bs = mut_bs.lock().await;
-#[cfg(not(feature = "async_io"))]
-                        let mut bs = mut_bs.lock().unwrap();
                         let (bytes_read, start_nonce, next_plot) = match p.read_async(&mut bs, scoop).await {
                             Ok(x) => x,
                             Err(e) => {
@@ -523,10 +517,7 @@ impl Reader {
 
                         match &pb {
                             Some(pb) => {
-#[cfg(feature = "async_io")]
                                 let mut pb = pb.lock().await;
-#[cfg(not(feature = "async_io"))]
-                                let mut pb = pb.lock().unwrap();
                                 pb.add(bytes_read as u64);
                             }
                             None => (),
