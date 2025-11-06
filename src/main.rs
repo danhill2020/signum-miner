@@ -110,6 +110,17 @@ fn print_simd_support() {
     }
 }
 
+fn print_banner() {
+    println!(
+        r#" ____  _                       _     __  __ _
+/ ___|| |_ _ __ ___  ___ _ __ | |_  | \/  (_)_ __   ___ ___
+\___ \| __| '__/ _ \/ _ \ '_ \| __| | |\/| | | '_ \ / __/ __|
+ ___) | |_| | |  __/  __/ | | | |_  | |  | | | | | | (_| (__
+|____/ \__|_|  \___|\___|_| |_|\__| |_|  |_|_|_| |_|\___\___|
+"#
+    );
+}
+
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -151,6 +162,8 @@ async fn main() {
         }
     };
     logger::init_logger(&cfg_loaded);
+
+    print_banner();
 
     info!(
         "{} v{}",
