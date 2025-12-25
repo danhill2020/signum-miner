@@ -590,10 +590,12 @@ impl Miner {
         // there might be a way to solve this without two nested moves
         let get_mining_info_interval = miner.get_mining_info_interval;
         let wakeup_after = miner.wakeup_after;
+        let miner_for_interval = miner.clone();
         tokio::spawn(async move {
             info!("→ Interval task started");
             Interval::new_interval(Duration::from_millis(get_mining_info_interval))
                 .for_each(move |_| {
+                    let miner_for_interval = miner_for_interval.clone();
                     let state = state.clone();
                     let reader = reader.clone();
                     let request_handler = request_handler.clone();
@@ -682,7 +684,7 @@ impl Miner {
                             }
                             _ => {
                                 // Record network error
-                                let miner_ref = miner.clone();
+                                let miner_ref = miner_for_interval.clone();
                                 tokio::spawn(async move {
                                     #[cfg(feature = "async_io")]
                                     let mut metrics = miner_ref.metrics.write().await;
@@ -801,6 +803,7 @@ impl Miner {
         miner.executor.clone().spawn(
             ReceiverStream::new(rx_nonce_data)
                 .for_each(move |nonce_data| {
+                    let miner = miner.clone();
                     let state = state.clone();
                     let request_handler = request_handler.clone();
                     let account_id_to_target_deadline = account_id_to_target_deadline.clone();

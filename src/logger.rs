@@ -124,12 +124,12 @@ mod tests {
     #[test]
     fn test_init_logger() {
         use crate::config::load_cfg;
-        let mut cfg = load_cfg("config.yaml");
- 
+        let mut cfg = load_cfg("config.yaml").expect("Failed to load config");
+
         cfg.console_log_level = log::LevelFilter::Error.to_string();
-    
+
         let _ = init_logger(&cfg);
-    
+
         trace!("TRACE");
         debug!("DEBUG");
         info!("INFO");

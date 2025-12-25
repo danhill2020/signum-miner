@@ -331,7 +331,7 @@ impl Reader {
                     match &pb {
                         Some(pb) => {
                             match pb.lock() {
-                                Ok(mut pb) => pb.add(bytes_read as u64),
+                                Ok(mut pb) => { pb.add(bytes_read as u64); },
                                 Err(poisoned) => {
                                     error!("reader: progress bar mutex poisoned, recovering...");
                                     let mut pb = poisoned.into_inner();
