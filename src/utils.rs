@@ -1,6 +1,3 @@
-use core_affinity;
-use rayon;
-
 pub fn new_thread_pool(num_threads: usize, thread_pinning: bool) -> rayon::ThreadPool {
     let core_ids = if thread_pinning {
         match core_affinity::get_core_ids() {
@@ -45,7 +42,7 @@ cfg_if! {
         pub fn get_device_id(path: &str) -> String {
             match Command::new("stat")
                 .arg(path)
-                .arg("-c %D")
+                .args(["-c", "%D"])
                 .output()
             {
                 Ok(output) => {

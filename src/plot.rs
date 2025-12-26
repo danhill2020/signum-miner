@@ -126,7 +126,7 @@ impl Plot {
 
         let size = fs::metadata(path)?.len();
         let exp_size = nonces * NONCE_SIZE;
-        if size != exp_size as u64 {
+        if size != exp_size {
             return Err(From::from(format!(
                 "expected plot size {} but got {}",
                 exp_size, size
@@ -146,7 +146,7 @@ impl Plot {
         };
 
         let plot_file_name = plot_file.to_string();
-        let sector_size = get_sector_size(&path.to_str().unwrap().to_owned());
+        let sector_size = get_sector_size(path.to_str().unwrap());
         if use_direct_io && sector_size / 64 > nonces {
             warn!(
                 "not enough nonces for using direct io: plot={}",
@@ -179,7 +179,7 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         self.read_offset = 0;
         self.align_offset = 0;
         let nonces = self.meta.nonces;
-        let mut seek_addr = u64::from(scoop) * nonces as u64 * SCOOP_SIZE;
+        let mut seek_addr = u64::from(scoop) * nonces * SCOOP_SIZE;
 
         // reopening file handles
         if !self.use_direct_io {
@@ -201,7 +201,7 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         self.read_offset = 0;
         self.align_offset = 0;
         let nonces = self.meta.nonces;
-        let mut seek_addr = u64::from(scoop) * nonces as u64 * SCOOP_SIZE;
+        let mut seek_addr = u64::from(scoop) * nonces * SCOOP_SIZE;
 
         if !self.use_direct_io {
             let f = open(&self.path)?;
@@ -240,7 +240,7 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
 
                 (bytes_to_read, true)
             } else {
-                (buffer_cap as usize, false)
+                (buffer_cap, false)
             };
 
         let offset = self.read_offset;
@@ -286,7 +286,7 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
             }
             (bytes_to_read, true)
         } else {
-            (buffer_cap as usize, false)
+            (buffer_cap, false)
         };
 
         let offset = self.read_offset;
@@ -305,7 +305,7 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         let mut rng = thread_rng();
         let rand_scoop = rng.gen_range(0, SCOOPS_IN_NONCE);
 
-        let mut seek_addr = rand_scoop as u64 * self.meta.nonces as u64 * SCOOP_SIZE;
+        let mut seek_addr = rand_scoop as u64 * self.meta.nonces * SCOOP_SIZE;
         if self.use_direct_io {
             self.round_seek_addr(&mut seek_addr);
         }
@@ -318,7 +318,7 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         let mut rng = thread_rng();
         let rand_scoop = rng.gen_range(0, SCOOPS_IN_NONCE);
 
-        let mut seek_addr = rand_scoop as u64 * self.meta.nonces as u64 * SCOOP_SIZE;
+        let mut seek_addr = rand_scoop as u64 * self.meta.nonces * SCOOP_SIZE;
         if self.use_direct_io {
             self.round_seek_addr(&mut seek_addr);
         }

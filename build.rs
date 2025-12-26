@@ -24,7 +24,7 @@ fn compile_windows_icon() {
             return;
         };
         let status = std::process::Command::new(windres_cmd)
-            .args(&["--input", rc_path, "--output", &res_path, "--output-format=coff"])
+            .args(["--input", rc_path, "--output", &res_path, "--output-format=coff"])
             .status()
             .expect("failed to run windres");
 

@@ -15,6 +15,8 @@ const C_INIT: [u32; 16] = [
     0x88B59D60, 0x60E2CEBA, 0x758B4B8B, 0x83E82A7F, 0xBC968828, 0xE6E00BF7, 0xBA839E55, 0x9B491C60,
 ];
 
+/// Deadline calculation using Shabal-256 (reference implementation)
+#[allow(dead_code)]
 pub fn shabal256_deadline_fast(data: &[u8], gensig: &[u8; 32]) -> u64 {
     let mut a = A_INIT;
     let mut b = B_INIT;
@@ -96,6 +98,7 @@ fn input_block_add(b: &mut [u32; 16], data: &[u32]) {
     }
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 fn input_block_add_dl(b: &mut [u32; 16], data_a: &[u32], data_b: &[u32]) {
     unsafe {
@@ -157,6 +160,7 @@ fn input_block_sub(c: &mut [u32; 16], data: &[u32]) {
     }
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 fn input_block_sub_dl(b: &mut [u32; 16], data_a: &[u32], data_b: &[u32]) {
     unsafe {
@@ -273,6 +277,7 @@ fn apply_p(a: &mut [u32; 12], b: &mut [u32; 16], c: &[u32; 16], data: &[u32]) {
         .wrapping_add(c[14]);
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 fn apply_p_dl(a: &mut [u32; 12], b: &mut [u32; 16], c: &[u32; 16], data_a: &[u32], data_b: &[u32]) {
     for element in b.iter_mut() {
@@ -329,6 +334,7 @@ fn apply_p_dl(a: &mut [u32; 12], b: &mut [u32; 16], c: &[u32; 16], data_a: &[u32
         .wrapping_add(c[14]);
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn perm_elt(
     a: &mut [u32; 12],
@@ -412,6 +418,7 @@ fn perm(a: &mut [u32; 12], b: &mut [u32; 16], c: &[u32; 16], data: &[u32]) {
     }
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 fn perm_dl(a: &mut [u32; 12], b: &mut [u32; 16], c: &[u32; 16], data_a: &[u32], data_b: &[u32]) {
     unsafe {

@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use crate::plot::SCOOP_SIZE;
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Serialize)]
 pub enum Benchmark {
     IO,
@@ -268,6 +269,7 @@ pub fn load_cfg(config: &str) -> Result<Cfg, String> {
 
     if cfg.hdd_use_direct_io {
         let cpu_nonces_per_cache = cfg.io_buffer_size / SCOOP_SIZE as usize;
+        #[allow(clippy::manual_is_multiple_of)]
         if cpu_nonces_per_cache % 64 != 0 || cfg.gpu_nonces_per_cache % 64 != 0 {
             return Err(format!(
                 "Configuration error: nonces_per_cache should be divisible by 64 when using direct I/O. \
@@ -291,7 +293,8 @@ pub fn validate_cfg(mut cfg: Cfg) -> Cfg {
         cfg.cpu_threads = cores;
     };
 
-    cfg.plot_dirs = cfg
+    #[allow(clippy::iter_overeager_cloned)]
+    let filtered_dirs: Vec<PathBuf> = cfg
         .plot_dirs
         .iter()
         .cloned()
@@ -307,6 +310,7 @@ pub fn validate_cfg(mut cfg: Cfg) -> Cfg {
             }
         })
         .collect();
+    cfg.plot_dirs = filtered_dirs;
 
     cfg
 }

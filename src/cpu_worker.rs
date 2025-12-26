@@ -12,7 +12,6 @@ use crate::miner::{Buffer, NonceData};
 use crate::poc_hashing::find_best_deadline_rust;
 use crate::reader::ReadReply;
 use crossbeam_channel::{Receiver, Sender};
-use std::u64;
 use tokio::sync::mpsc::Sender as TokioSender;
 
 #[cfg(any(feature = "simd", feature = "neon"))]
