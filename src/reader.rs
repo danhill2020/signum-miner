@@ -3,7 +3,6 @@ use crate::miner::Buffer;
 use crate::miner::CpuBuffer;
 use crate::plot::{Meta, Plot};
 use crate::utils::new_thread_pool;
-use crossbeam_channel;
 use crossbeam_channel::{Receiver, Sender};
 use pbr::{ProgressBar, Units};
 use rayon::prelude::*;
@@ -47,6 +46,7 @@ pub struct Reader {
 }
 
 impl Reader {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         drive_id_to_plots: HashMap<String, Arc<Vec<Mutex<Plot>>>>,
         total_size: u64,
@@ -192,6 +192,7 @@ impl Reader {
     }
 
     #[cfg(not(feature = "async_io"))]
+    #[allow(clippy::too_many_arguments)]
     fn create_read_task(
         &self,
         pb: Option<Arc<Mutex<pbr::ProgressBar<Stdout>>>>,
@@ -328,18 +329,15 @@ impl Reader {
 
                     nonces_processed += bytes_read as u64 / 64;
 
-                    match &pb {
-                        Some(pb) => {
-                            match pb.lock() {
-                                Ok(mut pb) => { pb.add(bytes_read as u64); },
-                                Err(poisoned) => {
-                                    error!("reader: progress bar mutex poisoned, recovering...");
-                                    let mut pb = poisoned.into_inner();
-                                    pb.add(bytes_read as u64);
-                                }
+                    if let Some(pb) = &pb {
+                        match pb.lock() {
+                            Ok(mut pb) => { pb.add(bytes_read as u64); },
+                            Err(poisoned) => {
+                                error!("reader: progress bar mutex poisoned, recovering...");
+                                let mut pb = poisoned.into_inner();
+                                pb.add(bytes_read as u64);
                             }
                         }
-                        None => (),
                     }
 
                     if show_drive_stats {
@@ -584,20 +582,19 @@ impl Reader {
 pub fn check_overlap(drive_id_to_plots: &HashMap<String, Arc<Vec<Mutex<Plot>>>>) -> bool {
     let plots: Vec<Meta> = drive_id_to_plots
         .values()
-        .map(|a| a.iter())
-        .flatten()
-        .filter_map(|plot| {
+        .flat_map(|a| a.iter())
+        .map(|plot| {
             #[cfg(feature = "async_io")]
             {
-                Some(plot.blocking_lock().meta.clone())
+                plot.blocking_lock().meta.clone()
             }
             #[cfg(not(feature = "async_io"))]
             {
                 match plot.lock() {
-                    Ok(guard) => Some(guard.meta.clone()),
+                    Ok(guard) => guard.meta.clone(),
                     Err(poisoned) => {
                         error!("check_overlap: mutex poisoned, recovering...");
-                        Some(poisoned.into_inner().meta.clone())
+                        poisoned.into_inner().meta.clone()
                     }
                 }
             }
@@ -610,7 +607,7 @@ pub fn check_overlap(drive_id_to_plots: &HashMap<String, Arc<Vec<Mutex<Plot>>>>)
             plots[i + 1..]
                 .par_iter()
                 .filter(|plot_b| {
-                    plot_a.account_id == plot_b.account_id && plot_b.overlaps_with(&plot_a)
+                    plot_a.account_id == plot_b.account_id && plot_b.overlaps_with(plot_a)
                 })
                 .count()
                 > 0

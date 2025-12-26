@@ -127,6 +127,7 @@ impl RequestHandler {
         self.client.get_mining_info()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn submit_nonce(
         &self,
         account_id: u64,

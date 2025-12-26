@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 #[cfg(feature = "async_io")]
 use tokio::sync::RwLock;
 #[cfg(not(feature = "async_io"))]
 use std::sync::RwLock;
 
 /// Comprehensive metrics tracking for the miner
+/// Some fields and methods are intentionally kept for future monitoring/debugging use
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MinerMetrics {
     /// Time when miner started
@@ -39,6 +41,7 @@ pub struct MinerMetrics {
     pub total_bytes_read: u64,
 }
 
+#[allow(dead_code)]
 impl MinerMetrics {
     pub fn new() -> Self {
         Self {
@@ -159,7 +162,7 @@ impl MinerMetrics {
     /// Get formatted metrics summary
     pub fn summary(&self) -> String {
         let mut summary = String::new();
-        summary.push_str(&format!("=== MINER METRICS ===\n"));
+        summary.push_str("=== MINER METRICS ===\n");
         summary.push_str(&format!("Uptime: {}\n", self.uptime_formatted()));
         summary.push_str(&format!("Rounds: {} completed, {} failed ({:.1}% success)\n",
             self.rounds_completed, self.rounds_failed, self.round_success_rate()));
@@ -226,6 +229,8 @@ pub fn new_shared_metrics() -> SharedMetrics {
 }
 
 /// Disk health monitor
+/// Some fields and methods are intentionally kept for future monitoring/debugging use
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DiskHealthInfo {
     pub drive_id: String,
@@ -235,6 +240,7 @@ pub struct DiskHealthInfo {
     pub consecutive_errors: u32,
 }
 
+#[allow(dead_code)]
 impl DiskHealthInfo {
     pub fn new(drive_id: String) -> Self {
         Self {
@@ -287,10 +293,12 @@ impl DiskHealthInfo {
 }
 
 /// Disk health monitor for all drives
+#[allow(dead_code)]
 pub struct DiskHealthMonitor {
     drives: HashMap<String, DiskHealthInfo>,
 }
 
+#[allow(dead_code)]
 impl DiskHealthMonitor {
     pub fn new() -> Self {
         Self {

@@ -2,6 +2,7 @@ use bytes::Bytes;
 use serde::de::{self, DeserializeOwned};
 use std::fmt;
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmitNonceRequest<'a> {
@@ -44,7 +45,7 @@ pub struct MiningInfoResponse {
 }
 
 fn default_target_deadline() -> u64 {
-    std::u64::MAX
+    u64::MAX
 }
 
 #[derive(Debug, Deserialize)]

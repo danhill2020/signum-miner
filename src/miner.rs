@@ -16,7 +16,6 @@ use crate::poc_hashing;
 use crate::reader::Reader;
 use crate::requests::RequestHandler;
 use crate::utils::{get_bus_type, get_device_id, new_thread_pool};
-use crossbeam_channel;
 use filetime::FileTime;
 use futures_util::{stream::StreamExt};
 use tokio::sync::mpsc;
@@ -36,7 +35,6 @@ use std::sync::Mutex;
 //use std::sync::Arc;
 //use tokio::sync::Mutex;
 use std::thread;
-use std::u64;
 use stopwatch::Stopwatch;
 use tokio::runtime::Handle;
 
@@ -135,6 +133,7 @@ pub struct NonceData {
     pub account_id: u64,
 }
 
+#[allow(dead_code)]
 pub trait Buffer {
     fn get_buffer(&mut self) -> Arc<Mutex<Vec<u8>>>;
     fn get_buffer_for_writing(&mut self) -> Arc<Mutex<Vec<u8>>>;
@@ -181,6 +180,7 @@ impl Buffer for CpuBuffer {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn scan_plots(
     plot_dirs: &[PathBuf],
     use_direct_io: bool,
@@ -201,10 +201,10 @@ fn scan_plots(
                         Ok(entry) => {
                             let file = entry.path();
                             if let Ok(p) = Plot::new(&file, use_direct_io && !is_usb, dummy) {
-                                let drive_id = get_device_id(&file.to_str().unwrap_or_default().to_string());
-                                let plots = drive_id_to_plots.entry(drive_id).or_insert(Vec::new());
+                                let drive_id = get_device_id(file.to_str().unwrap_or_default());
+                                let plots = drive_id_to_plots.entry(drive_id).or_default();
 
-                                local_capacity += p.meta.nonces as u64;
+                                local_capacity += p.meta.nonces;
                                 plots.push(Mutex::new(p));
                                 num_plots += 1;
                             } else {
@@ -369,7 +369,7 @@ impl Miner {
         let cpu_nonces_per_cache = cfg.io_buffer_size / SCOOP_SIZE as usize;
         let buffer_size_cpu = cpu_nonces_per_cache * SCOOP_SIZE as usize;
         let (tx_empty_buffers, rx_empty_buffers) =
-            crossbeam_channel::bounded(buffer_count as usize);
+            crossbeam_channel::bounded(buffer_count);
         let (tx_read_replies_cpu, rx_read_replies_cpu) =
             crossbeam_channel::bounded(cpu_buffer_count);
 
@@ -839,7 +839,7 @@ impl Miner {
                                     .insert(nonce_data.account_id, deadline);
 
                                 if inner_submit_only_best {
-                                    best_nonce_data = nonce_data.clone();
+                                    best_nonce_data = nonce_data;
                                 } else {
                                     #[cfg(feature = "async_io")]
                                     request_handler.lock().await.submit_nonce(
@@ -853,7 +853,7 @@ impl Miner {
                                     );
                                     #[cfg(not(feature = "async_io"))]
                                     match request_handler.lock() {
-                                        Ok(mut rh) => rh.submit_nonce(
+                                        Ok(rh) => rh.submit_nonce(
                                             nonce_data.account_id,
                                             nonce_data.nonce,
                                             nonce_data.height,
@@ -926,7 +926,7 @@ impl Miner {
                                         );
                                         #[cfg(not(feature = "async_io"))]
                                         match request_handler.lock() {
-                                            Ok(mut rh) => rh.submit_nonce(
+                                            Ok(rh) => rh.submit_nonce(
                                                 best_nonce_data.account_id,
                                                 best_nonce_data.nonce,
                                                 best_nonce_data.height,
