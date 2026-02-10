@@ -1,8 +1,8 @@
+use crate::plot::SCOOP_SIZE;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use crate::plot::SCOOP_SIZE;
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Serialize)]
@@ -20,6 +20,7 @@ pub struct Cfg {
     #[serde(default)]
     pub plot_dirs: Vec<PathBuf>,
 
+    #[serde(deserialize_with = "deserialize_url")]
     pub url: ::url::Url,
 
     #[serde(default = "default_hdd_reader_thread_count")]
@@ -130,6 +131,16 @@ impl<'de> Deserialize<'de> for Benchmark {
             _ => Benchmark::Disabled,
         })
     }
+}
+
+fn deserialize_url<'de, D>(deserializer: D) -> Result<::url::Url, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    let trimmed = raw.trim();
+    ::url::Url::parse(trimmed)
+        .map_err(|e| serde::de::Error::custom(format!("invalid url '{}': {}", trimmed, e)))
 }
 
 fn default_secret_phrase() -> HashMap<u64, String> {
@@ -264,8 +275,12 @@ pub fn load_cfg(config: &str) -> Result<Cfg, String> {
     let cfg_str = fs::read_to_string(config)
         .map_err(|e| format!("Failed to open config file '{}': {}. Please check that the file exists and is readable.", config, e))?;
 
-    let cfg: Cfg = serde_yaml::from_str(&cfg_str)
-        .map_err(|e| format!("Failed to parse config file '{}': {}. Please check YAML syntax.", config, e))?;
+    let cfg: Cfg = serde_yaml::from_str(&cfg_str).map_err(|e| {
+        format!(
+            "Failed to parse config file '{}': {}. Please check YAML syntax.",
+            config, e
+        )
+    })?;
 
     if cfg.hdd_use_direct_io {
         let cpu_nonces_per_cache = cfg.io_buffer_size / SCOOP_SIZE as usize;
@@ -325,7 +340,6 @@ impl Cfg {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,8 +357,7 @@ mod tests {
         println!("YAML content:\n{}", contents);
         println!("Path to config: {:?}", config_path);
         // Konfiguration laden
-        let cfg = load_cfg(config_path.to_str().unwrap())
-            .expect("Failed to load config in test");
+        let cfg = load_cfg(config_path.to_str().unwrap()).expect("Failed to load config in test");
 
         // Ausgabe für Debugging
         println!("cfg.plot_dirs = {:?}", cfg.plot_dirs);
@@ -355,5 +368,32 @@ mod tests {
 
         let expected_path = PathBuf::from("test_data");
         assert_eq!(cfg.plot_dirs, vec![expected_path]);
+    }
+
+    #[test]
+    fn test_load_cfg_trims_url_whitespace() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let file_name = format!(
+            "signum-miner-test-{}.yaml",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Failed to read clock")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(file_name);
+
+        let yaml = "\
+plot_dirs: []
+url: \"  https://pool.signumcoin.ro  \"
+";
+        std::fs::write(&path, yaml).expect("Failed to write temporary config");
+
+        let cfg = load_cfg(path.to_str().expect("Invalid temp path"))
+            .expect("Failed to load config with whitespace URL");
+
+        assert_eq!(cfg.url.as_str(), "https://pool.signumcoin.ro/");
+
+        std::fs::remove_file(path).expect("Failed to remove temporary config");
     }
 }
