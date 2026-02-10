@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use url::Url;
 use crate::plot::SCOOP_SIZE;
 
 #[allow(clippy::upper_case_acronyms)]
@@ -20,7 +21,8 @@ pub struct Cfg {
     #[serde(default)]
     pub plot_dirs: Vec<PathBuf>,
 
-    pub url: ::url::Url,
+    #[serde(deserialize_with = "deserialize_url")]
+    pub url: Url,
 
     #[serde(default = "default_hdd_reader_thread_count")]
     pub hdd_reader_thread_count: usize,
@@ -130,6 +132,43 @@ impl<'de> Deserialize<'de> for Benchmark {
             _ => Benchmark::Disabled,
         })
     }
+}
+
+/// Custom deserializer for the URL field that handles common config mistakes:
+/// - Strips accidental leading/trailing quotes (e.g., "'http://...'" -> "http://...")
+/// - Strips leading/trailing whitespace
+/// - Provides helpful error messages for invalid URLs
+fn deserialize_url<'de, D>(deserializer: D) -> Result<Url, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    let mut url_str = raw.trim();
+
+    // Strip accidental surrounding single or double quotes
+    // This handles cases like: url: "'http://localhost:8125'"
+    if (url_str.starts_with('\'') && url_str.ends_with('\''))
+        || (url_str.starts_with('"') && url_str.ends_with('"'))
+    {
+        url_str = &url_str[1..url_str.len() - 1];
+        url_str = url_str.trim();
+    }
+
+    if url_str.is_empty() {
+        return Err(serde::de::Error::custom(
+            "URL is empty. Please set the 'url' field to your pool or wallet address, \
+            e.g., url: 'http://localhost:8125'"
+        ));
+    }
+
+    Url::parse(url_str).map_err(|e| {
+        serde::de::Error::custom(format!(
+            "Invalid server URL '{}': {}. \
+            Make sure the URL includes the scheme (http:// or https://). \
+            Example: url: 'http://localhost:8125' or url: 'https://pool.example.com'",
+            url_str, e
+        ))
+    })
 }
 
 fn default_secret_phrase() -> HashMap<u64, String> {
@@ -265,7 +304,22 @@ pub fn load_cfg(config: &str) -> Result<Cfg, String> {
         .map_err(|e| format!("Failed to open config file '{}': {}. Please check that the file exists and is readable.", config, e))?;
 
     let cfg: Cfg = serde_yaml::from_str(&cfg_str)
-        .map_err(|e| format!("Failed to parse config file '{}': {}. Please check YAML syntax.", config, e))?;
+        .map_err(|e| format!("Failed to parse config file '{}': {}. Please check YAML syntax.\n\
+            Note: The 'url' field must be a valid URL (e.g., url: 'http://localhost:8125').\n\
+            Do not add extra quotes around the URL value beyond the YAML single quotes.", config, e))?;
+
+    // Validate URL scheme
+    match cfg.url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(format!(
+                "Invalid URL scheme '{}' in config. The server URL must use 'http' or 'https'.\n\
+                Current URL: {}\n\
+                Example: url: 'http://localhost:8125' or url: 'https://pool.example.com'",
+                scheme, cfg.url
+            ));
+        }
+    }
 
     if cfg.hdd_use_direct_io {
         let cpu_nonces_per_cache = cfg.io_buffer_size / SCOOP_SIZE as usize;

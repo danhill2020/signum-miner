@@ -275,6 +275,8 @@ fn scan_plots(
 
 impl Miner {
     pub fn new(cfg: Cfg, executor: Handle) -> Miner {
+        info!("server URL: {}", cfg.url);
+
         let (drive_id_to_plots, total_size) =
             scan_plots(&cfg.plot_dirs, cfg.hdd_use_direct_io, cfg.benchmark_cpu());
 
@@ -682,7 +684,7 @@ impl Miner {
                                     state.sw.restart();
                                 }
                             }
-                            _ => {
+                            Err(e) => {
                                 // Record network error
                                 let miner_ref = miner_for_interval.clone();
                                 tokio::spawn(async move {
@@ -712,14 +714,18 @@ impl Miner {
                                 if state.first {
                                     error!(
                                         "{: <80}",
-                                        "error getting mining info, please check server config"
+                                        format!("error getting mining info: {:?}", e)
+                                    );
+                                    error!(
+                                        "{: <80}",
+                                        "please check server URL in config and network connectivity"
                                     );
                                     state.first = false;
                                     state.outage = true;
                                 } else if !state.outage {
                                     error!(
                                         "{: <80}",
-                                        "error getting mining info => connection outage..."
+                                        format!("error getting mining info => connection outage: {:?}", e)
                                     );
                                     state.outage = true;
                                 }
