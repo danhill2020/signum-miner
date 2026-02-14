@@ -6,20 +6,18 @@ use crate::future::interval::Interval;
 use crate::gpu_worker::create_gpu_worker_task;
 #[cfg(feature = "opencl")]
 use crate::gpu_worker_async::create_gpu_worker_task_async;
+use crate::metrics::{new_shared_disk_health, new_shared_metrics, SharedDiskHealth, SharedMetrics};
 #[cfg(feature = "opencl")]
 use crate::ocl::GpuBuffer;
 #[cfg(feature = "opencl")]
 use crate::ocl::GpuContext;
-use crate::metrics::{SharedMetrics, SharedDiskHealth, new_shared_metrics, new_shared_disk_health};
 use crate::plot::{Plot, SCOOP_SIZE};
 use crate::poc_hashing;
 use crate::reader::Reader;
 use crate::requests::RequestHandler;
 use crate::utils::{get_bus_type, get_device_id, new_thread_pool};
 use filetime::FileTime;
-use futures_util::{stream::StreamExt};
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use futures_util::stream::StreamExt;
 #[cfg(feature = "opencl")]
 use ocl_core::Mem;
 use std::cmp::{max, min};
@@ -28,17 +26,17 @@ use std::fs::read_dir;
 use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
-#[cfg(feature = "async_io")]
-use tokio::sync::Mutex;
 #[cfg(not(feature = "async_io"))]
 use std::sync::Mutex;
+use tokio::sync::mpsc;
+#[cfg(feature = "async_io")]
+use tokio::sync::Mutex;
+use tokio_stream::wrappers::ReceiverStream;
 //use std::sync::Arc;
 //use tokio::sync::Mutex;
 use std::thread;
 use stopwatch::Stopwatch;
 use tokio::runtime::Handle;
-
-
 
 pub struct Miner {
     plot_dirs: Vec<PathBuf>,
@@ -212,7 +210,11 @@ fn scan_plots(
                             }
                         }
                         Err(e) => {
-                            warn!("failed to read entry in {}: {}", plot_dir.to_string_lossy(), e);
+                            warn!(
+                                "failed to read entry in {}: {}",
+                                plot_dir.to_string_lossy(),
+                                e
+                            );
                         }
                     }
                 }
@@ -368,8 +370,7 @@ impl Miner {
 
         let cpu_nonces_per_cache = cfg.io_buffer_size / SCOOP_SIZE as usize;
         let buffer_size_cpu = cpu_nonces_per_cache * SCOOP_SIZE as usize;
-        let (tx_empty_buffers, rx_empty_buffers) =
-            crossbeam_channel::bounded(buffer_count);
+        let (tx_empty_buffers, rx_empty_buffers) = crossbeam_channel::bounded(buffer_count);
         let (tx_read_replies_cpu, rx_read_replies_cpu) =
             crossbeam_channel::bounded(cpu_buffer_count);
 
@@ -507,7 +508,7 @@ impl Miner {
             get_mining_info_interval: max(1000, cfg.get_mining_info_interval),
             executor,
             wakeup_after: cfg.hdd_wakeup_after * 1000, // ms -> s
-            submit_only_best : cfg.submit_only_best,
+            submit_only_best: cfg.submit_only_best,
             metrics,
             disk_health,
         }
@@ -584,7 +585,6 @@ impl Miner {
         };
 
         let reader = miner.reader.clone();
-
 
         let state = miner.state.clone();
         // there might be a way to solve this without two nested moves
@@ -808,6 +808,12 @@ impl Miner {
                     let request_handler = request_handler.clone();
                     let account_id_to_target_deadline = account_id_to_target_deadline.clone();
                     async move {
+                        let mut submission_to_send: Option<(u64, u64, u64, u64, u64, u64, [u8; 32])> =
+                            None;
+                        let mut best_submission_to_send: Option<
+                            (u64, u64, u64, u64, u64, u64, [u8; 32]),
+                        > = None;
+
                         #[cfg(feature = "async_io")]
                         let mut state = state.lock().await;
                         #[cfg(not(feature = "async_io"))]
@@ -841,8 +847,7 @@ impl Miner {
                                 if inner_submit_only_best {
                                     best_nonce_data = nonce_data;
                                 } else {
-                                    #[cfg(feature = "async_io")]
-                                    request_handler.lock().await.submit_nonce(
+                                    submission_to_send = Some((
                                         nonce_data.account_id,
                                         nonce_data.nonce,
                                         nonce_data.height,
@@ -850,31 +855,7 @@ impl Miner {
                                         nonce_data.deadline,
                                         deadline,
                                         state.generation_signature_bytes,
-                                    );
-                                    #[cfg(not(feature = "async_io"))]
-                                    match request_handler.lock() {
-                                        Ok(rh) => rh.submit_nonce(
-                                            nonce_data.account_id,
-                                            nonce_data.nonce,
-                                            nonce_data.height,
-                                            nonce_data.block,
-                                            nonce_data.deadline,
-                                            deadline,
-                                            state.generation_signature_bytes,
-                                        ),
-                                        Err(poisoned) => {
-                                            error!("run: request_handler mutex poisoned during nonce submit, recovering...");
-                                            poisoned.into_inner().submit_nonce(
-                                                nonce_data.account_id,
-                                                nonce_data.nonce,
-                                                nonce_data.height,
-                                                nonce_data.block,
-                                                nonce_data.deadline,
-                                                deadline,
-                                                state.generation_signature_bytes,
-                                            );
-                                        }
-                                    }
+                                    ));
                                 }
                             }
 
@@ -914,8 +895,7 @@ impl Miner {
                                     if best_nonce_data.height == state.height {
                                         let deadline =
                                             best_nonce_data.deadline / best_nonce_data.base_target;
-                                        #[cfg(feature = "async_io")]
-                                        request_handler.lock().await.submit_nonce(
+                                        best_submission_to_send = Some((
                                             best_nonce_data.account_id,
                                             best_nonce_data.nonce,
                                             best_nonce_data.height,
@@ -923,31 +903,7 @@ impl Miner {
                                             best_nonce_data.deadline,
                                             deadline,
                                             state.generation_signature_bytes,
-                                        );
-                                        #[cfg(not(feature = "async_io"))]
-                                        match request_handler.lock() {
-                                            Ok(rh) => rh.submit_nonce(
-                                                best_nonce_data.account_id,
-                                                best_nonce_data.nonce,
-                                                best_nonce_data.height,
-                                                best_nonce_data.block,
-                                                best_nonce_data.deadline,
-                                                deadline,
-                                                state.generation_signature_bytes,
-                                            ),
-                                            Err(poisoned) => {
-                                                error!("run: request_handler mutex poisoned during best nonce submit, recovering...");
-                                                poisoned.into_inner().submit_nonce(
-                                                    best_nonce_data.account_id,
-                                                    best_nonce_data.nonce,
-                                                    best_nonce_data.height,
-                                                    best_nonce_data.block,
-                                                    best_nonce_data.deadline,
-                                                    deadline,
-                                                    state.generation_signature_bytes,
-                                                );
-                                            }
-                                        }
+                                        ));
                                     }
 
                                     state.sw.restart();
@@ -955,12 +911,105 @@ impl Miner {
                                 }
                             }
                         }
+
+                        drop(state);
+
+                        if let Some((
+                            account_id,
+                            nonce,
+                            height,
+                            block,
+                            deadline_unadjusted,
+                            deadline,
+                            gen_sig,
+                        )) = submission_to_send
+                        {
+                            #[cfg(feature = "async_io")]
+                            request_handler.lock().await.submit_nonce(
+                                account_id,
+                                nonce,
+                                height,
+                                block,
+                                deadline_unadjusted,
+                                deadline,
+                                gen_sig,
+                            );
+                            #[cfg(not(feature = "async_io"))]
+                            match request_handler.lock() {
+                                Ok(rh) => rh.submit_nonce(
+                                    account_id,
+                                    nonce,
+                                    height,
+                                    block,
+                                    deadline_unadjusted,
+                                    deadline,
+                                    gen_sig,
+                                ),
+                                Err(poisoned) => {
+                                    error!("run: request_handler mutex poisoned during nonce submit, recovering...");
+                                    poisoned.into_inner().submit_nonce(
+                                        account_id,
+                                        nonce,
+                                        height,
+                                        block,
+                                        deadline_unadjusted,
+                                        deadline,
+                                        gen_sig,
+                                    );
+                                }
+                            }
+                        }
+
+                        if let Some((
+                            account_id,
+                            nonce,
+                            height,
+                            block,
+                            deadline_unadjusted,
+                            deadline,
+                            gen_sig,
+                        )) = best_submission_to_send
+                        {
+                            #[cfg(feature = "async_io")]
+                            request_handler.lock().await.submit_nonce(
+                                account_id,
+                                nonce,
+                                height,
+                                block,
+                                deadline_unadjusted,
+                                deadline,
+                                gen_sig,
+                            );
+                            #[cfg(not(feature = "async_io"))]
+                            match request_handler.lock() {
+                                Ok(rh) => rh.submit_nonce(
+                                    account_id,
+                                    nonce,
+                                    height,
+                                    block,
+                                    deadline_unadjusted,
+                                    deadline,
+                                    gen_sig,
+                                ),
+                                Err(poisoned) => {
+                                    error!("run: request_handler mutex poisoned during best nonce submit, recovering...");
+                                    poisoned.into_inner().submit_nonce(
+                                        account_id,
+                                        nonce,
+                                        height,
+                                        block,
+                                        deadline_unadjusted,
+                                        deadline,
+                                        gen_sig,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }),
         );
         loop {
-        sleep(Duration::from_secs(60)).await;
+            sleep(Duration::from_secs(60)).await;
         }
     }
-
 }

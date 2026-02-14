@@ -3,20 +3,20 @@ use rand::prelude::*;
 use std::cmp::{max, min};
 use std::error::Error;
 use std::fs;
-use std::fs::{File, OpenOptions};
-#[cfg(feature = "async_io")]
-use tokio::fs::File as TokioFile;
 #[cfg(not(feature = "async_io"))]
 use std::fs::File as TokioFile;
-#[cfg(feature = "async_io")]
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use std::fs::{File, OpenOptions};
+use std::io;
 #[cfg(feature = "async_io")]
 use std::io::Seek;
-use std::io;
-use std::io::{SeekFrom};
+use std::io::SeekFrom;
 #[cfg(not(feature = "async_io"))]
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "async_io")]
+use tokio::fs::File as TokioFile;
+#[cfg(feature = "async_io")]
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 const SCOOPS_IN_NONCE: u64 = 4096;
 const SHABAL256_HASH_SIZE: u64 = 32;
@@ -87,7 +87,6 @@ cfg_if! {
 
         const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
         const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
-        const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
 
         pub fn open_using_direct_io<P: AsRef<Path>>(path: P) -> io::Result<File> {
             OpenOptions::new()
@@ -99,14 +98,18 @@ cfg_if! {
         pub fn open<P: AsRef<Path>>(path: P) -> io::Result<File> {
             OpenOptions::new()
                 .read(true)
-                .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_RANDOM_ACCESS)
+                .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
                 .open(path)
         }
     }
 }
 
 impl Plot {
-    pub fn new(path: &PathBuf, mut use_direct_io: bool, dummy: bool) -> Result<Plot, Box<dyn Error>> {
+    pub fn new(
+        path: &PathBuf,
+        mut use_direct_io: bool,
+        dummy: bool,
+    ) -> Result<Plot, Box<dyn Error>> {
         if !path.is_file() {
             return Err(From::from(format!(
                 "{} is not a file",
@@ -140,9 +143,13 @@ impl Plot {
         };
         let fh = {
             #[cfg(feature = "async_io")]
-            { TokioFile::from_std(fh_std) }
+            {
+                TokioFile::from_std(fh_std)
+            }
             #[cfg(not(feature = "async_io"))]
-            { fh_std }
+            {
+                fh_std
+            }
         };
 
         let plot_file_name = plot_file.to_string();
@@ -174,8 +181,8 @@ impl Plot {
         })
     }
 
-#[cfg(not(feature = "async_io"))]
-pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
+    #[cfg(not(feature = "async_io"))]
+    pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         self.read_offset = 0;
         self.align_offset = 0;
         let nonces = self.meta.nonces;
@@ -193,8 +200,7 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         }
         self.seek_base = seek_addr;
 
-        self.fh
-            .seek(SeekFrom::Start(seek_addr + self.align_offset))
+        self.fh.seek(SeekFrom::Start(seek_addr + self.align_offset))
     }
 
     #[cfg(feature = "async_io")]
@@ -222,13 +228,12 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
             .await
     }
 
-#[cfg(not(feature = "async_io"))]
+    #[cfg(not(feature = "async_io"))]
     pub fn read(&mut self, bs: &mut Vec<u8>, scoop: u32) -> Result<(usize, u64, bool), io::Error> {
         let read_offset = self.read_offset;
         let buffer_cap = bs.capacity();
-        let start_nonce = self.meta.start_nonce
-            + u64::from(scoop) * self.meta.nonces
-            + self.read_offset / 64;
+        let start_nonce =
+            self.meta.start_nonce + u64::from(scoop) * self.meta.nonces + self.read_offset / 64;
 
         let (bytes_to_read, finished) =
             if read_offset as usize + buffer_cap >= (SCOOP_SIZE * self.meta.nonces) as usize {
@@ -274,25 +279,23 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
     ) -> Result<(usize, u64, bool), io::Error> {
         let read_offset = self.read_offset;
         let buffer_cap = bs.capacity();
-        let start_nonce = self.meta.start_nonce
-            + u64::from(scoop) * self.meta.nonces
-            + self.read_offset / 64;
+        let start_nonce =
+            self.meta.start_nonce + u64::from(scoop) * self.meta.nonces + self.read_offset / 64;
 
-        let (bytes_to_read, finished) = if read_offset as usize + buffer_cap
-            >= (SCOOP_SIZE * self.meta.nonces) as usize
-        {
-            let mut bytes_to_read = (SCOOP_SIZE * self.meta.nonces) as usize
-                - self.read_offset as usize;
-            if self.use_direct_io {
-                let r = bytes_to_read % self.sector_size as usize;
-                if r != 0 {
-                    bytes_to_read -= r;
+        let (bytes_to_read, finished) =
+            if read_offset as usize + buffer_cap >= (SCOOP_SIZE * self.meta.nonces) as usize {
+                let mut bytes_to_read =
+                    (SCOOP_SIZE * self.meta.nonces) as usize - self.read_offset as usize;
+                if self.use_direct_io {
+                    let r = bytes_to_read % self.sector_size as usize;
+                    if r != 0 {
+                        bytes_to_read -= r;
+                    }
                 }
-            }
-            (bytes_to_read, true)
-        } else {
-            (buffer_cap, false)
-        };
+                (bytes_to_read, true)
+            } else {
+                (buffer_cap, false)
+            };
 
         let offset = self.read_offset;
         if !self.dummy {
@@ -308,7 +311,7 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         Ok((bytes_to_read, start_nonce, finished))
     }
 
-#[cfg(not(feature = "async_io"))]
+    #[cfg(not(feature = "async_io"))]
     pub fn seek_random(&mut self) -> io::Result<u64> {
         let mut rng = thread_rng();
         let rand_scoop = rng.gen_range(0, SCOOPS_IN_NONCE);
