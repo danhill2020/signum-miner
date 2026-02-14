@@ -78,8 +78,8 @@ Please download from the corresponding release. Direct I/O will be
 automatically disabled for plot directories residing on USB drives.
 
 `io_buffer_size` lets you tune how much data is read from disk per task. The
-default of 4&nbsp;MiB works well for most drives but you may lower it for slow
-USB devices.
+default of 16&nbsp;MiB improves throughput on many external drives; for very
+slow USB devices you may lower it.
 
 `capacity_check_interval` defines how often the miner rescans the plot
 directories to update its total capacity. The default of 6&nbsp;hours is a good

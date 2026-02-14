@@ -172,7 +172,7 @@ fn default_cpu_nonces_per_cache() -> usize {
 }
 
 fn default_io_buffer_size() -> usize {
-    4 * 1024 * 1024
+    16 * 1024 * 1024
 }
 
 fn default_cpu_thread_pinning() -> bool {
