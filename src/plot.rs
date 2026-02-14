@@ -193,7 +193,8 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         }
         self.seek_base = seek_addr;
 
-        self.fh.seek(SeekFrom::Start(seek_addr))
+        self.fh
+            .seek(SeekFrom::Start(seek_addr + self.align_offset))
     }
 
     #[cfg(feature = "async_io")]
@@ -216,7 +217,9 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         }
         self.seek_base = seek_addr;
 
-        self.fh.seek(SeekFrom::Start(seek_addr)).await
+        self.fh
+            .seek(SeekFrom::Start(seek_addr + self.align_offset))
+            .await
     }
 
 #[cfg(not(feature = "async_io"))]
@@ -244,9 +247,11 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
             };
 
         let offset = self.read_offset;
-        let seek_addr = SeekFrom::Start(self.seek_base + self.align_offset + offset);
         if !self.dummy {
-            self.fh.seek(seek_addr)?;
+            if offset == 0 {
+                self.fh
+                    .seek(SeekFrom::Start(self.seek_base + self.align_offset))?;
+            }
             self.fh.read_exact(&mut bs[0..bytes_to_read])?;
             // interrupt avoider (not implemented)
             // let read_chunk_size_in_nonces = 65536;
@@ -290,9 +295,12 @@ pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
         };
 
         let offset = self.read_offset;
-        let seek_addr = SeekFrom::Start(self.seek_base + self.align_offset + offset);
         if !self.dummy {
-            self.fh.seek(seek_addr).await?;
+            if offset == 0 {
+                self.fh
+                    .seek(SeekFrom::Start(self.seek_base + self.align_offset))
+                    .await?;
+            }
             self.fh.read_exact(&mut bs[0..bytes_to_read]).await?;
         }
         self.read_offset += bytes_to_read as u64;
