@@ -72,6 +72,7 @@ pub struct State {
     scoop: u32,
     first: bool,
     outage: bool,
+    pending_capacity_drop: Option<u64>,
 }
 
 impl State {
@@ -90,6 +91,7 @@ impl State {
             scanning: false,
             first: true,
             outage: false,
+            pending_capacity_drop: None,
         }
     }
 
@@ -178,14 +180,25 @@ impl Buffer for CpuBuffer {
     }
 }
 
+fn looks_like_plot_file(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+
+    let parts: Vec<&str> = name.split('_').collect();
+    parts.len() == 3 && parts.iter().all(|part| part.parse::<u64>().is_ok())
+}
+
 #[allow(clippy::type_complexity)]
 fn scan_plots(
     plot_dirs: &[PathBuf],
     use_direct_io: bool,
     dummy: bool,
-) -> (HashMap<String, Arc<Vec<Mutex<Plot>>>>, u64) {
+) -> (HashMap<String, Arc<Vec<Mutex<Plot>>>>, u64, bool, bool) {
     let mut drive_id_to_plots: HashMap<String, Vec<Mutex<Plot>>> = HashMap::new();
     let mut global_capacity: u64 = 0;
+    let mut scan_had_errors = false;
+    let mut had_empty_plot_dir = false;
 
     for plot_dir in plot_dirs {
         let bus_type = get_bus_type(plot_dir.to_str().unwrap_or_default());
@@ -198,18 +211,25 @@ fn scan_plots(
                     match entry {
                         Ok(entry) => {
                             let file = entry.path();
-                            if let Ok(p) = Plot::new(&file, use_direct_io && !is_usb, dummy) {
-                                let drive_id = get_device_id(file.to_str().unwrap_or_default());
-                                let plots = drive_id_to_plots.entry(drive_id).or_default();
+                            match Plot::new(&file, use_direct_io && !is_usb, dummy) {
+                                Ok(p) => {
+                                    let drive_id = get_device_id(file.to_str().unwrap_or_default());
+                                    let plots = drive_id_to_plots.entry(drive_id).or_default();
 
-                                local_capacity += p.meta.nonces;
-                                plots.push(Mutex::new(p));
-                                num_plots += 1;
-                            } else {
-                                warn!("failed to load plot {}", file.to_string_lossy());
+                                    local_capacity += p.meta.nonces;
+                                    plots.push(Mutex::new(p));
+                                    num_plots += 1;
+                                }
+                                Err(e) => {
+                                    if looks_like_plot_file(&file) {
+                                        scan_had_errors = true;
+                                    }
+                                    warn!("failed to load plot {}: {}", file.to_string_lossy(), e);
+                                }
                             }
                         }
                         Err(e) => {
+                            scan_had_errors = true;
                             warn!(
                                 "failed to read entry in {}: {}",
                                 plot_dir.to_string_lossy(),
@@ -220,6 +240,7 @@ fn scan_plots(
                 }
             }
             Err(e) => {
+                scan_had_errors = true;
                 warn!("could not read dir {}: {}", plot_dir.to_string_lossy(), e);
                 continue;
             }
@@ -235,6 +256,7 @@ fn scan_plots(
 
         global_capacity += local_capacity;
         if num_plots == 0 {
+            had_empty_plot_dir = true;
             warn!("no plots in {}", plot_dir.to_string_lossy());
         }
     }
@@ -272,12 +294,70 @@ fn scan_plots(
         global_capacity as f64 / 4.0 / 1024.0 / 1024.0
     );
 
-    (drive_id_to_plots, global_capacity * 64)
+    (drive_id_to_plots, global_capacity * 64, scan_had_errors, had_empty_plot_dir)
+}
+
+fn should_apply_capacity_update(
+    old_size: u64,
+    new_size: u64,
+    scan_had_errors: bool,
+    had_empty_plot_dir: bool,
+) -> bool {
+    if new_size >= old_size {
+        return true;
+    }
+
+    // Protect against temporary drive outages or mount hiccups reducing reported capacity.
+    // If the scan had filesystem errors, only accept equal or higher capacity.
+    if scan_had_errors {
+        return false;
+    }
+
+    // A mount hiccup can leave a configured plot directory temporarily empty without an I/O error.
+    // Treat large drops (>= 25%) combined with empty plot dirs as suspicious and keep prior capacity.
+    let is_large_drop = old_size > 0 && new_size.saturating_mul(100) < old_size.saturating_mul(75);
+    !(had_empty_plot_dir && is_large_drop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{looks_like_plot_file, should_apply_capacity_update};
+
+    #[test]
+    fn capacity_drop_with_scan_errors_is_rejected() {
+        assert!(!should_apply_capacity_update(100, 50, true, false));
+    }
+
+    #[test]
+    fn capacity_drop_without_scan_errors_is_accepted() {
+        assert!(should_apply_capacity_update(100, 50, false, false));
+    }
+
+    #[test]
+    fn capacity_increase_with_scan_errors_is_accepted() {
+        assert!(should_apply_capacity_update(100, 120, true, false));
+    }
+
+    #[test]
+    fn large_drop_with_empty_plot_dir_is_rejected() {
+        assert!(!should_apply_capacity_update(100, 70, false, true));
+    }
+
+    #[test]
+    fn small_drop_with_empty_plot_dir_is_accepted() {
+        assert!(should_apply_capacity_update(100, 90, false, true));
+    }
+
+    #[test]
+    fn plot_filename_detection_works() {
+        assert!(looks_like_plot_file(std::path::Path::new("123_0_1000")));
+        assert!(!looks_like_plot_file(std::path::Path::new("notes.txt")));
+    }
 }
 
 impl Miner {
     pub fn new(cfg: Cfg, executor: Handle) -> Miner {
-        let (drive_id_to_plots, total_size) =
+        let (drive_id_to_plots, total_size, _, _) =
             scan_plots(&cfg.plot_dirs, cfg.hdd_use_direct_io, cfg.benchmark_cpu());
 
         let cpu_threads = cfg.cpu_threads.max(1);
@@ -515,7 +595,7 @@ impl Miner {
     }
 
     pub async fn refresh_capacity(&self) {
-        let (drive_id_to_plots, total_size) =
+        let (drive_id_to_plots, total_size, scan_had_errors, had_empty_plot_dir) =
             scan_plots(&self.plot_dirs, self.hdd_use_direct_io, self.benchmark_cpu);
 
         #[cfg(feature = "async_io")]
@@ -529,6 +609,61 @@ impl Miner {
             }
         };
         let old_size = reader.total_size;
+
+        if !should_apply_capacity_update(old_size, total_size, scan_had_errors, had_empty_plot_dir) {
+            if scan_had_errors {
+                warn!(
+                    "capacity rescan had filesystem errors and would reduce capacity ({:.4} -> {:.4} TiB). Keeping previous capacity.",
+                    (old_size / 64) as f64 / 4.0 / 1024.0 / 1024.0,
+                    (total_size / 64) as f64 / 4.0 / 1024.0 / 1024.0
+                );
+                return;
+            }
+
+            #[cfg(feature = "async_io")]
+            let mut state = self.state.lock().await;
+            #[cfg(not(feature = "async_io"))]
+            let mut state = match self.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    error!("refresh_capacity: state mutex poisoned, recovering...");
+                    poisoned.into_inner()
+                }
+            };
+
+            if state.pending_capacity_drop == Some(total_size) {
+                warn!(
+                    "capacity rescan still shows reduced capacity with empty plot directories ({:.4} -> {:.4} TiB). Applying update after confirmation.",
+                    (old_size / 64) as f64 / 4.0 / 1024.0 / 1024.0,
+                    (total_size / 64) as f64 / 4.0 / 1024.0 / 1024.0
+                );
+                state.pending_capacity_drop = None;
+            } else {
+                state.pending_capacity_drop = Some(total_size);
+                warn!(
+                    "capacity rescan saw a large drop with empty plot directories ({:.4} -> {:.4} TiB). Waiting for a second matching rescan before applying.",
+                    (old_size / 64) as f64 / 4.0 / 1024.0 / 1024.0,
+                    (total_size / 64) as f64 / 4.0 / 1024.0 / 1024.0
+                );
+                return;
+            }
+        } else {
+            #[cfg(feature = "async_io")]
+            {
+                self.state.lock().await.pending_capacity_drop = None;
+            }
+            #[cfg(not(feature = "async_io"))]
+            {
+                match self.state.lock() {
+                    Ok(mut state) => state.pending_capacity_drop = None,
+                    Err(poisoned) => {
+                        error!("refresh_capacity: state mutex poisoned while clearing pending drop, recovering...");
+                        poisoned.into_inner().pending_capacity_drop = None;
+                    }
+                }
+            }
+        }
+
         reader.update_plots(drive_id_to_plots, total_size, self.benchmark_cpu);
         drop(reader);
 
