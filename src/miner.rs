@@ -95,7 +95,24 @@ impl State {
         }
     }
 
-    fn update_mining_info(&mut self, mining_info: &MiningInfo) {
+    fn update_mining_info(&mut self, mining_info: &MiningInfo) -> Result<(), String> {
+        let gensig_bytes = poc_hashing::decode_gensig(&mining_info.generation_signature)?;
+
+        if mining_info.base_target == 0 {
+            return Err(format!(
+                "invalid base_target=0 from pool at height {}",
+                mining_info.height
+            ));
+        }
+
+        let scoop = poc_hashing::calculate_scoop(mining_info.height, &gensig_bytes);
+        if scoop >= 4096 {
+            return Err(format!(
+                "invalid scoop {} for height {}",
+                scoop, mining_info.height
+            ));
+        }
+
         for best_deadlines in self.account_id_to_best_deadline.values_mut() {
             *best_deadlines = u64::MAX;
         }
@@ -104,12 +121,9 @@ impl State {
         self.base_target = mining_info.base_target;
         self.server_target_deadline = mining_info.target_deadline;
 
-        self.generation_signature_bytes =
-            poc_hashing::decode_gensig(&mining_info.generation_signature);
+        self.generation_signature_bytes = gensig_bytes;
         self.generation_signature = mining_info.generation_signature.clone();
 
-        let scoop =
-            poc_hashing::calculate_scoop(mining_info.height, &self.generation_signature_bytes);
         info!(
             "{: <80}",
             format!("new block: height={}, scoop={}", mining_info.height, scoop)
@@ -119,6 +133,7 @@ impl State {
         self.sw.restart();
         self.processed_reader_tasks = 0;
         self.scanning = true;
+        Ok(())
     }
 }
 
@@ -769,7 +784,13 @@ impl Miner {
                                     state.outage = false;
                                 }
                                 if mining_info.generation_signature != state.generation_signature {
-                                    state.update_mining_info(&mining_info);
+                                    if let Err(e) = state.update_mining_info(&mining_info) {
+                                        warn!(
+                                            "{: <80}",
+                                            format!("ignoring malformed mining info: {}", e)
+                                        );
+                                        return;
+                                    }
                                     #[cfg(feature = "async_io")]
                                     reader.lock().await.start_reading(
                                         mining_info.height,
@@ -960,6 +981,13 @@ impl Miner {
                             }
                         };
 
+                        if nonce_data.base_target == 0 {
+                            warn!(
+                                "dropping nonce with base_target=0 at height {}",
+                                nonce_data.height
+                            );
+                            return;
+                        }
                         let deadline = nonce_data.deadline / nonce_data.base_target;
                         if state.height == nonce_data.height {
                             let best_deadline = *state
@@ -998,7 +1026,14 @@ impl Miner {
                                 state.processed_reader_tasks += 1;
                                 if state.processed_reader_tasks == reader_task_count {
                                     let round_time_ms = state.sw.elapsed_ms();
-                                    let speed_mibs = total_size as f64 * 1000.0 / 1024.0 / 1024.0 / round_time_ms as f64;
+                                    let speed_mibs = if round_time_ms > 0 {
+                                        total_size as f64 * 1000.0
+                                            / 1024.0
+                                            / 1024.0
+                                            / round_time_ms as f64
+                                    } else {
+                                        0.0
+                                    };
 
                                     info!(
                                         "{: <80}",
@@ -1027,7 +1062,9 @@ impl Miner {
                                     });
 
                                     // Submit now our best one, if configured that way
-                                    if best_nonce_data.height == state.height {
+                                    if best_nonce_data.height == state.height
+                                        && best_nonce_data.base_target > 0
+                                    {
                                         let deadline =
                                             best_nonce_data.deadline / best_nonce_data.base_target;
                                         best_submission_to_send = Some((

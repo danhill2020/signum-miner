@@ -3,10 +3,18 @@ use crate::shabal256::{shabal256_deadline_fast, shabal256_hash_fast};
 #[allow(dead_code)]
 const SCOOP_SIZE: usize = 64;
 
-pub fn decode_gensig(gensig: &str) -> [u8; 32] {
-    let mut gensig_bytes = [0; 32];
-    gensig_bytes[..].clone_from_slice(&hex::decode(gensig).unwrap());
-    gensig_bytes
+pub fn decode_gensig(gensig: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(gensig)
+        .map_err(|e| format!("invalid gensig hex {:?}: {}", gensig, e))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "invalid gensig length: expected 32 bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let mut gensig_bytes = [0u8; 32];
+    gensig_bytes.copy_from_slice(&bytes);
+    Ok(gensig_bytes)
 }
 
 pub fn calculate_scoop(height: u64, gensig: &[u8; 32]) -> u32 {

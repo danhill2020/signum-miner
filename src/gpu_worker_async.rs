@@ -3,16 +3,15 @@ use crate::ocl::GpuContext;
 use crate::ocl::{gpu_hash, gpu_transfer, gpu_transfer_and_hash};
 use crate::reader::{BufferInfo, ReadReply};
 use crossbeam_channel::{Receiver, Sender};
-use futures::sync::mpsc;
-use futures::{Future, Sink};
 use std::sync::Arc;
 use std::u64;
+use tokio::sync::mpsc::Sender as TokioSender;
 
 pub fn create_gpu_worker_task_async(
     benchmark: bool,
     rx_read_replies: Receiver<ReadReply>,
     tx_empty_buffers: Sender<Box<dyn Buffer + Send>>,
-    tx_nonce_data: mpsc::Sender<NonceData>,
+    tx_nonce_data: TokioSender<NonceData>,
     context_mu: Arc<GpuContext>,
     num_drives: usize,
 ) -> impl FnOnce() {
@@ -40,19 +39,15 @@ pub fn create_gpu_worker_task_async(
                 // forward 'drive finished signal'
                 if read_reply.info.finished {
                     let deadline = u64::MAX;
-                    tx_nonce_data
-                        .clone()
-                        .send(NonceData {
-                            height: read_reply.info.height,
-                            block: read_reply.info.block,
-                            base_target: read_reply.info.base_target,
-                            deadline,
-                            nonce: 0,
-                            reader_task_processed: read_reply.info.finished,
-                            account_id: read_reply.info.account_id,
-                        })
-                        .wait()
-                        .ok(); // Handle channel close gracefully
+                    let _ = tx_nonce_data.blocking_send(NonceData {
+                        height: read_reply.info.height,
+                        block: read_reply.info.block,
+                        base_target: read_reply.info.base_target,
+                        deadline,
+                        nonce: 0,
+                        reader_task_processed: read_reply.info.finished,
+                        account_id: read_reply.info.account_id,
+                    });
                 }
                 let _ = tx_empty_buffers.send(buffer); // Handle channel close gracefully
                 continue;
@@ -75,17 +70,13 @@ pub fn create_gpu_worker_task_async(
             if read_reply.info.gpu_signal == 2 && active_height == read_reply.info.height {
                 drive_count += 1;
                 if drive_count == num_drives && !new_round {
-                    let result = gpu_hash(
-                        &context_mu,
-                        last_buffer_info_a.len / 64,
-                        last_buffer_a.as_ref().unwrap(),
-                    );
-                    let deadline = result.0;
-                    let offset = result.1;
+                    if let Some(last_buf) = last_buffer_a.as_ref() {
+                        let result =
+                            gpu_hash(&context_mu, last_buffer_info_a.len / 64, last_buf);
+                        let deadline = result.0;
+                        let offset = result.1;
 
-                    let _ = tx_nonce_data
-                        .clone()
-                        .send(NonceData {
+                        let _ = tx_nonce_data.blocking_send(NonceData {
                             height: last_buffer_info_a.height,
                             block: last_buffer_info_a.block,
                             base_target: last_buffer_info_a.base_target,
@@ -93,10 +84,12 @@ pub fn create_gpu_worker_task_async(
                             nonce: offset.saturating_add(last_buffer_info_a.start_nonce),
                             reader_task_processed: last_buffer_info_a.finished,
                             account_id: last_buffer_info_a.account_id,
-                        })
-                        .wait(); // Handle channel close gracefully
-                    if let Ok(sink_buffer) = rx_sink.try_recv() {
-                        let _ = tx_empty_buffers.send(sink_buffer); // Handle channel close gracefully
+                        });
+                        if let Ok(sink_buffer) = rx_sink.try_recv() {
+                            let _ = tx_empty_buffers.send(sink_buffer);
+                        }
+                    } else {
+                        warn!("gpu_worker_async: end signal with no buffered data, skipping hash");
                     }
                 }
                 continue;
@@ -105,42 +98,46 @@ pub fn create_gpu_worker_task_async(
                 continue;
             }
 
+            let gpu_buffers = match buffer.get_gpu_buffers() {
+                Some(b) => b,
+                None => {
+                    error!("gpu_worker_async: missing GPU buffers, dropping read");
+                    let _ = tx_empty_buffers.send(buffer);
+                    continue;
+                }
+            };
             if new_round {
-                gpu_transfer(
-                    &context_mu,
-                    buffer.get_gpu_buffers().unwrap(),
-                    *read_reply.info.gensig,
-                );
-            } else {
+                gpu_transfer(&context_mu, gpu_buffers, *read_reply.info.gensig);
+            } else if let Some(last_buf) = last_buffer_a.as_ref() {
                 let result = gpu_transfer_and_hash(
                     &context_mu,
-                    buffer.get_gpu_buffers().unwrap(),
+                    gpu_buffers,
                     last_buffer_info_a.len / 64,
-                    last_buffer_a.as_ref().unwrap(),
+                    last_buf,
                 );
                 let deadline = result.0;
                 let offset = result.1;
 
-                let _ = tx_nonce_data
-                    .clone()
-                    .send(NonceData {
-                        height: last_buffer_info_a.height,
-                        block: last_buffer_info_a.block,
-                        base_target: last_buffer_info_a.base_target,
-                        deadline,
-                        nonce: offset.saturating_add(last_buffer_info_a.start_nonce),
-                        reader_task_processed: last_buffer_info_a.finished,
-                        account_id: last_buffer_info_a.account_id,
-                    })
-                    .wait(); // Handle channel close gracefully
+                let _ = tx_nonce_data.blocking_send(NonceData {
+                    height: last_buffer_info_a.height,
+                    block: last_buffer_info_a.block,
+                    base_target: last_buffer_info_a.base_target,
+                    deadline,
+                    nonce: offset.saturating_add(last_buffer_info_a.start_nonce),
+                    reader_task_processed: last_buffer_info_a.finished,
+                    account_id: last_buffer_info_a.account_id,
+                });
                 if let Ok(sink_buffer) = rx_sink.try_recv() {
-                    let _ = tx_empty_buffers.send(sink_buffer); // Handle channel close gracefully
+                    let _ = tx_empty_buffers.send(sink_buffer);
                 }
+            } else {
+                warn!("gpu_worker_async: pipelined read without prior buffer, treating as new round");
+                gpu_transfer(&context_mu, gpu_buffers, *read_reply.info.gensig);
             }
             last_buffer_a = buffer.get_gpu_data();
             last_buffer_info_a = read_reply.info;
             new_round = false;
-            let _ = tx_sink.send(buffer); // Handle channel close gracefully
+            let _ = tx_sink.send(buffer);
         }
     }
 }

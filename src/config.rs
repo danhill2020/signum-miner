@@ -297,7 +297,7 @@ pub fn load_cfg(config: &str) -> Result<Cfg, String> {
 }
 
 pub fn validate_cfg(mut cfg: Cfg) -> Cfg {
-    let cores = num_cpus::get();
+    let cores = num_cpus::get().max(1);
     if cfg.cpu_threads == 0 {
         cfg.cpu_threads = cores;
     } else if cfg.cpu_threads > cores {
@@ -308,6 +308,31 @@ pub fn validate_cfg(mut cfg: Cfg) -> Cfg {
         cfg.cpu_threads = cores;
     };
 
+    if cfg.timeout == 0 {
+        warn!("timeout=0 is not allowed, defaulting to 5000ms");
+        cfg.timeout = 5000;
+    } else if cfg.timeout > 600_000 {
+        warn!(
+            "timeout={}ms is unreasonably high, capping at 600000ms",
+            cfg.timeout
+        );
+        cfg.timeout = 600_000;
+    }
+
+    if cfg.io_buffer_size < SCOOP_SIZE as usize * 64 {
+        warn!(
+            "io_buffer_size={} is too small for direct I/O (need at least {}); raising",
+            cfg.io_buffer_size,
+            SCOOP_SIZE as usize * 64
+        );
+        cfg.io_buffer_size = SCOOP_SIZE as usize * 64;
+    }
+
+    if cfg.get_mining_info_interval == 0 {
+        warn!("get_mining_info_interval=0 is not allowed, defaulting to 3000ms");
+        cfg.get_mining_info_interval = 3000;
+    }
+
     #[allow(clippy::iter_overeager_cloned)]
     let filtered_dirs: Vec<PathBuf> = cfg
         .plot_dirs
@@ -315,10 +340,10 @@ pub fn validate_cfg(mut cfg: Cfg) -> Cfg {
         .cloned()
         .filter(|plot_dir| {
             if !plot_dir.exists() {
-                warn!("path {} does not exist", plot_dir.to_str().unwrap());
+                warn!("path {} does not exist", plot_dir.to_string_lossy());
                 false
             } else if !plot_dir.is_dir() {
-                warn!("path {} is not a directory", plot_dir.to_str().unwrap());
+                warn!("path {} is not a directory", plot_dir.to_string_lossy());
                 false
             } else {
                 true

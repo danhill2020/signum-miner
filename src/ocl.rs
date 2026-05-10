@@ -32,7 +32,13 @@ macro_rules! to_string {
 }
 
 pub fn platform_info() {
-    let platform_ids = core::get_platform_ids().unwrap();
+    let platform_ids = match core::get_platform_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            error!("OCL: failed to enumerate platforms: {}", e);
+            return;
+        }
+    };
     for (i, platform_id) in platform_ids.iter().enumerate() {
         info!(
             "OCL: platform {}, {} - {}",
@@ -40,7 +46,13 @@ pub fn platform_info() {
             to_string!(core::get_platform_info(&platform_id, PlatformInfo::Name)),
             to_string!(core::get_platform_info(&platform_id, PlatformInfo::Version))
         );
-        let device_ids = core::get_device_ids(&platform_id, None, None).unwrap();
+        let device_ids = match core::get_device_ids(&platform_id, None, None) {
+            Ok(ids) => ids,
+            Err(e) => {
+                error!("OCL: failed to enumerate devices on platform {}: {}", i, e);
+                continue;
+            }
+        };
         let context_properties = ContextProperties::new().platform(*platform_id);
         for (j, device_id) in device_ids.iter().enumerate() {
             info!(
@@ -51,20 +63,56 @@ pub fn platform_info() {
             );
 
             // calculate ideal nonces_per_cache multipliers
-            let context =
-                core::create_context(Some(&context_properties), &[*device_id], None, None).unwrap();
-            let src_cstring = CString::new(SRC).unwrap();
-            let program = core::create_program_with_source(&context, &[src_cstring]).unwrap();
-            core::build_program(
-                &program,
-                None::<&[()]>,
-                &CString::new("").unwrap(),
+            let context = match core::create_context(
+                Some(&context_properties),
+                &[*device_id],
                 None,
                 None,
-            )
-            .unwrap();
-            let kernel1 = core::create_kernel(&program, "calculate_deadlines").unwrap();
-            let kernel2 = core::create_kernel(&program, "find_min").unwrap();
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("OCL: failed to create context on device {}: {}", j, e);
+                    continue;
+                }
+            };
+            let src_cstring = match CString::new(SRC) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("OCL: kernel source contains null byte: {}", e);
+                    continue;
+                }
+            };
+            let program = match core::create_program_with_source(&context, &[src_cstring]) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("OCL: failed to create program: {}", e);
+                    continue;
+                }
+            };
+            let empty_opts = match CString::new("") {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if let Err(e) =
+                core::build_program(&program, None::<&[()]>, &empty_opts, None, None)
+            {
+                error!("OCL: build_program failed on device {}: {}", j, e);
+                continue;
+            }
+            let kernel1 = match core::create_kernel(&program, "calculate_deadlines") {
+                Ok(k) => k,
+                Err(e) => {
+                    error!("OCL: failed to create kernel 'calculate_deadlines': {}", e);
+                    continue;
+                }
+            };
+            let kernel2 = match core::create_kernel(&program, "find_min") {
+                Ok(k) => k,
+                Err(e) => {
+                    error!("OCL: failed to create kernel 'find_min': {}", e);
+                    continue;
+                }
+            };
             let cores = get_cores(*device_id) as usize;
             let kernel1_workgroup_size = get_kernel_work_group_size(&kernel1, *device_id);
             let kernel2_workgroup_size = get_kernel_work_group_size(&kernel2, *device_id);
@@ -86,13 +134,25 @@ pub fn platform_info() {
 
 pub fn gpu_info(cfg: &Cfg) {
     if cfg.gpu_worker_task_count > 0 {
-        let platform_ids = core::get_platform_ids().unwrap();
+        let platform_ids = match core::get_platform_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                error!("OCL: failed to enumerate platforms: {}. Shutting down...", e);
+                process::exit(1);
+            }
+        };
         if cfg.gpu_platform >= platform_ids.len() {
             error!("OCL: Selected OpenCL platform doesn't exist. Shutting down...");
             process::exit(0);
         }
         let platform = platform_ids[cfg.gpu_platform];
-        let device_ids = core::get_device_ids(&platform, None, None).unwrap();
+        let device_ids = match core::get_device_ids(&platform, None, None) {
+            Ok(ids) => ids,
+            Err(e) => {
+                error!("OCL: failed to enumerate devices: {}. Shutting down...", e);
+                process::exit(1);
+            }
+        };
         if cfg.gpu_device >= device_ids.len() {
             error!("OCL: Selected OpenCL device doesn't exist. Shutting down...");
             process::exit(0);
@@ -119,32 +179,47 @@ pub fn gpu_info(cfg: &Cfg) {
             0
         };
 
-        match core::get_device_info(&device, DeviceInfo::GlobalMemSize).unwrap() {
+        let mem_info = match core::get_device_info(&device, DeviceInfo::GlobalMemSize) {
+            Ok(info) => info,
+            Err(e) => {
+                error!("OCL: failed to query GPU memory size: {}. Shutting down...", e);
+                process::exit(1);
+            }
+        };
+        match mem_info {
             core::DeviceInfoResult::GlobalMemSize(mem) => {
                 info!(
                     "GPU: RAM={}MiB, Cores={}",
                     mem / 1024 / 1024,
                     to_string!(core::get_device_info(&device, DeviceInfo::MaxComputeUnits))
                 );
-                info!(
-                    "GPU: RAM usage (estimated)={}MiB",
-                    cfg.gpu_nonces_per_cache * 64 * (gpu_num_buffers) / 1024 / 1024
-                        + 45 * cfg.gpu_threads
-                );
 
-                if cfg.gpu_nonces_per_cache * 64 * (gpu_num_buffers) / 1024 / 1024
-                    + 45 * cfg.gpu_threads
-                    > mem as usize / 1024 / 1024
-                {
+                let usage_bytes = cfg
+                    .gpu_nonces_per_cache
+                    .checked_mul(64)
+                    .and_then(|v| v.checked_mul(gpu_num_buffers));
+                let usage_mib = match usage_bytes {
+                    Some(b) => b / 1024 / 1024 + 45 * cfg.gpu_threads,
+                    None => {
+                        error!(
+                            "GPU: gpu_nonces_per_cache * 64 * buffers overflows. \
+                             Reduce gpu_nonces_per_cache or gpu_worker_task_count. Shutting down..."
+                        );
+                        process::exit(1);
+                    }
+                };
+
+                info!("GPU: RAM usage (estimated)={}MiB", usage_mib);
+
+                let mem_mib = mem as usize / 1024 / 1024;
+                if usage_mib > mem_mib {
                     warn!(
                         "GPU: Low on GPU memory. If your settings don't work, \
                          please reduce gpu_worker_threads and/or gpu_nonces_per_cache."
                     );
                 }
 
-                if cfg.gpu_nonces_per_cache * 64 * (gpu_num_buffers) / 1024 / 1024
-                    > mem as usize / 1024 / 1024
-                {
+                if usage_mib.saturating_sub(45 * cfg.gpu_threads) > mem_mib {
                     error!(
                         "GPU: Insufficient GPU memory. Please reduce gpu_worker_threads \
                          and/or gpu_nonces_per_cache. Shutting down..."
@@ -152,7 +227,10 @@ pub fn gpu_info(cfg: &Cfg) {
                     process::exit(0);
                 }
             }
-            _ => panic!("Unexpected error. Can't obtain GPU memory size."),
+            _ => {
+                error!("OCL: unexpected response type when querying GPU memory size. Shutting down...");
+                process::exit(1);
+            }
         }
     } else if cfg.cpu_worker_task_count == 0 {
         error!("CPU, GPU: no workers configured. Shutting down...");
@@ -624,16 +702,30 @@ pub fn get_result(gpu_context: &Arc<GpuContext>) -> (u64, u64) {
 }
 
 fn get_kernel_work_group_size(x: &core::Kernel, y: core::DeviceId) -> usize {
-    match core::get_kernel_work_group_info(x, y, KernelWorkGroupInfo::WorkGroupSize).unwrap() {
-        core::KernelWorkGroupInfoResult::WorkGroupSize(kws) => kws,
-        _ => panic!("Unexpected error"),
+    match core::get_kernel_work_group_info(x, y, KernelWorkGroupInfo::WorkGroupSize) {
+        Ok(core::KernelWorkGroupInfoResult::WorkGroupSize(kws)) => kws,
+        Ok(_) => {
+            warn!("OCL: unexpected response type for kernel work group size, defaulting to 64");
+            64
+        }
+        Err(e) => {
+            warn!("OCL: failed to query kernel work group size ({}), defaulting to 64", e);
+            64
+        }
     }
 }
 
 fn get_cores(device: core::DeviceId) -> u32 {
-    match core::get_device_info(device, DeviceInfo::MaxComputeUnits).unwrap() {
-        core::DeviceInfoResult::MaxComputeUnits(mcu) => mcu,
-        _ => panic!("Unexpected error"),
+    match core::get_device_info(device, DeviceInfo::MaxComputeUnits) {
+        Ok(core::DeviceInfoResult::MaxComputeUnits(mcu)) => mcu,
+        Ok(_) => {
+            warn!("OCL: unexpected response type for compute unit count, defaulting to 1");
+            1
+        }
+        Err(e) => {
+            warn!("OCL: failed to query compute units ({}), defaulting to 1", e);
+            1
+        }
     }
 }
 

@@ -1,5 +1,5 @@
 use crate::com::api::*;
-use reqwest::{Client as InnerClient, header::{HeaderMap, HeaderName}};
+use reqwest::{Client as InnerClient, header::{HeaderMap, HeaderName, HeaderValue}};
 #[cfg(feature = "async_io")]
 use tokio::sync::Mutex;
 #[cfg(not(feature = "async_io"))]
@@ -71,6 +71,15 @@ impl Client {
         format!("signum-miner/{}", env!("CARGO_PKG_VERSION"))
     }
 
+    fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
+        match HeaderValue::from_str(value) {
+            Ok(v) => {
+                headers.insert(name, v);
+            }
+            Err(e) => warn!("client: skipping invalid header value for {}: {}", name, e),
+        }
+    }
+
     fn submit_nonce_headers(
         proxy_details: ProxyDetails,
         total_size_gb: usize,
@@ -78,27 +87,42 @@ impl Client {
     ) -> HeaderMap {
         let ua = Client::ua();
         let mut headers = HeaderMap::new();
-        headers.insert("User-Agent", ua.to_owned().parse().unwrap());
+        Self::insert_header(&mut headers, "User-Agent", &ua);
 
         if proxy_details == ProxyDetails::Enabled {
-            headers.insert("X-Capacity", total_size_gb.to_string().parse().unwrap());
-            headers.insert("X-Miner", ua.to_owned().parse().unwrap());
+            Self::insert_header(&mut headers, "X-Capacity", &total_size_gb.to_string());
+            Self::insert_header(&mut headers, "X-Miner", &ua);
 
             let hostname = get()
                 .ok()
                 .and_then(|h| h.into_string().ok())
                 .unwrap_or_default();
 
-            headers.insert("X-Minername", hostname.parse().unwrap());
-            headers.insert(
+            Self::insert_header(&mut headers, "X-Minername", &hostname);
+            Self::insert_header(
+                &mut headers,
                 "X-Plotfile",
-                format!("signum-miner-proxy/{}", hostname).parse().unwrap(),
+                &format!("signum-miner-proxy/{}", hostname),
             );
         }
 
         for (key, value) in additional_headers {
-            let header_name = HeaderName::from_bytes(&key.into_bytes()).unwrap();
-            headers.insert(header_name, value.parse().unwrap());
+            let name = match HeaderName::from_bytes(key.as_bytes()) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("client: skipping invalid header name {:?}: {}", key, e);
+                    continue;
+                }
+            };
+            match HeaderValue::from_str(&value) {
+                Ok(v) => {
+                    headers.insert(name, v);
+                }
+                Err(e) => warn!(
+                    "client: skipping invalid header value for {:?}: {}",
+                    key, e
+                ),
+            }
         }
 
         headers
@@ -118,10 +142,19 @@ impl Client {
 
         let headers = Client::submit_nonce_headers(proxy_details.clone(), total_size_gb, additional_headers);
 
-        let client = InnerClient::builder()
+        let client = match InnerClient::builder()
             .timeout(Duration::from_millis(timeout))
             .build()
-            .unwrap();
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "client: failed to build HTTP client with custom timeout ({}); falling back to default client",
+                    e
+                );
+                InnerClient::new()
+            }
+        };
 
         Self {
             inner: client,
@@ -135,10 +168,17 @@ impl Client {
 
     pub fn uri_for(&self, path: &str) -> Url {
         let mut url = self.base_uri.clone();
-        url.path_segments_mut()
-            .expect("cannot be base")
-            .pop_if_empty()
-            .push(path);
+        match url.path_segments_mut() {
+            Ok(mut segs) => {
+                segs.pop_if_empty().push(path);
+            }
+            Err(_) => {
+                warn!(
+                    "client: base URL {} cannot have path segments, using as-is",
+                    self.base_uri
+                );
+            }
+        }
         url
     }
 
@@ -147,7 +187,7 @@ impl Client {
         self.total_size_gb = total_size_gb;
         if self.proxy_details == ProxyDetails::Enabled {
             let mut headers = self.headers.lock().await;
-            headers.insert("X-Capacity", total_size_gb.to_string().parse().unwrap());
+            Self::insert_header(&mut headers, "X-Capacity", &total_size_gb.to_string());
         }
     }
 
@@ -155,8 +195,14 @@ impl Client {
     pub fn update_capacity(&mut self, total_size_gb: usize) {
         self.total_size_gb = total_size_gb;
         if self.proxy_details == ProxyDetails::Enabled {
-            let mut headers = self.headers.lock().unwrap();
-            headers.insert("X-Capacity", total_size_gb.to_string().parse().unwrap());
+            let mut headers = match self.headers.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    warn!("client: headers mutex poisoned during update_capacity, recovering...");
+                    poisoned.into_inner()
+                }
+            };
+            Self::insert_header(&mut headers, "X-Capacity", &total_size_gb.to_string());
         }
     }
 
@@ -164,7 +210,13 @@ impl Client {
         #[cfg(feature = "async_io")]
         let headers = { self.headers.lock().await.clone() };
         #[cfg(not(feature = "async_io"))]
-        let headers = { self.headers.lock().unwrap().clone() };
+        let headers = match self.headers.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => {
+                warn!("client: headers mutex poisoned during get_mining_info, recovering...");
+                poisoned.into_inner().clone()
+            }
+        };
 
         let res = self
             .inner
@@ -206,10 +258,17 @@ impl Client {
         #[cfg(feature = "async_io")]
         let mut headers = { self.headers.lock().await.clone() };
         #[cfg(not(feature = "async_io"))]
-        let mut headers = { self.headers.lock().unwrap().clone() };
-        headers.insert(
+        let mut headers = match self.headers.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => {
+                warn!("client: headers mutex poisoned during submit, recovering...");
+                poisoned.into_inner().clone()
+            }
+        };
+        Self::insert_header(
+            &mut headers,
             "X-Deadline",
-            submission_data.deadline.to_string().parse().unwrap(),
+            &submission_data.deadline.to_string(),
         );
 
         let mut uri = self.uri_for("burst");
