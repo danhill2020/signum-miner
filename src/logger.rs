@@ -22,6 +22,22 @@ fn to_log_level(s: &str, default: log::LevelFilter) -> log::LevelFilter {
     }
 }
 
+fn build_stdout_only_config(
+    pattern: &str,
+    level_console: log::LevelFilter,
+) -> Result<Config, Box<dyn std::error::Error>> {
+    let stdout = ConsoleAppender::builder()
+        .encoder(Box::new(PatternEncoder::new(pattern)))
+        .build();
+    Ok(Config::builder()
+        .appender(
+            Appender::builder()
+                .filter(Box::new(ThresholdFilter::new(level_console)))
+                .build("stdout", Box::new(stdout)),
+        )
+        .build(Root::builder().appender("stdout").build(LevelFilter::Info))?)
+}
+
 pub fn init_logger(cfg: &Cfg) -> log4rs::Handle {
     let level_console = to_log_level(&cfg.console_log_level, log::LevelFilter::Info);
     let level_logfile = to_log_level(&cfg.logfile_log_level, log::LevelFilter::Warn);
@@ -42,12 +58,7 @@ pub fn init_logger(cfg: &Cfg) -> log4rs::Handle {
         .encoder(Box::new(PatternEncoder::new(&console_log_pattern)))
         .build();
 
-    let roller = FixedWindowRoller::builder()
-        .base(1)
-        .build("log/signum-miner.{}.log", cfg.logfile_max_count)
-        .unwrap();
-    let trigger = SizeTrigger::new(&cfg.logfile_max_size * 1024 * 1024);
-    let policy = Box::new(CompoundPolicy::new(Box::new(trigger), Box::new(roller)));
+    let stdout_only_config = || build_stdout_only_config(&console_log_pattern, level_console);
 
     let config = if level_logfile == log::LevelFilter::Off {
         Config::builder()
@@ -57,12 +68,55 @@ pub fn init_logger(cfg: &Cfg) -> log4rs::Handle {
                     .build("stdout", Box::new(stdout)),
             )
             .build(Root::builder().appender("stdout").build(LevelFilter::Info))
-            .unwrap()
+            .unwrap_or_else(|e| {
+                eprintln!("logger: failed to build stdout-only config: {}", e);
+                stdout_only_config().expect("stdout-only logger must build")
+            })
     } else {
-        let logfile = RollingFileAppender::builder()
+        // Best-effort ensure log dir exists.
+        if let Err(e) = std::fs::create_dir_all("log") {
+            eprintln!(
+                "logger: cannot create log directory ({}); continuing with stdout-only logging",
+                e
+            );
+        }
+
+        let roller = match FixedWindowRoller::builder()
+            .base(1)
+            .build("log/signum-miner.{}.log", cfg.logfile_max_count)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "logger: failed to build log roller ({}); falling back to stdout-only",
+                    e
+                );
+                return log4rs::init_config(
+                    stdout_only_config().expect("stdout-only logger must build"),
+                )
+                .expect("log4rs init must succeed");
+            }
+        };
+        let trigger = SizeTrigger::new(cfg.logfile_max_size * 1024 * 1024);
+        let policy = Box::new(CompoundPolicy::new(Box::new(trigger), Box::new(roller)));
+
+        let logfile = match RollingFileAppender::builder()
             .encoder(Box::new(PatternEncoder::new(&logfile_log_pattern)))
             .build("log/signum-miner.1.log", policy)
-            .unwrap();
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!(
+                    "logger: failed to open log file ({}); falling back to stdout-only",
+                    e
+                );
+                return log4rs::init_config(
+                    stdout_only_config().expect("stdout-only logger must build"),
+                )
+                .expect("log4rs init must succeed");
+            }
+        };
+
         Config::builder()
             .appender(
                 Appender::builder()
@@ -80,9 +134,15 @@ pub fn init_logger(cfg: &Cfg) -> log4rs::Handle {
                     .appender("logfile")
                     .build(LevelFilter::Trace),
             )
-            .unwrap()
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "logger: failed to build full config ({}); falling back to stdout-only",
+                    e
+                );
+                stdout_only_config().expect("stdout-only logger must build")
+            })
     };
-    log4rs::init_config(config).unwrap()
+    log4rs::init_config(config).expect("log4rs init must succeed")
 }
 
 #[cfg(test)]

@@ -113,11 +113,19 @@ impl Plot {
         if !path.is_file() {
             return Err(From::from(format!(
                 "{} is not a file",
-                path.to_str().unwrap()
+                path.to_string_lossy()
             )));
         }
 
-        let plot_file = path.file_name().unwrap().to_str().unwrap();
+        let plot_file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "plot path has no valid UTF-8 file name: {}",
+                    path.to_string_lossy()
+                )
+            })?;
         let parts: Vec<&str> = plot_file.split('_').collect();
         if parts.len() != 3 {
             return Err(From::from("plot file has wrong format"));
@@ -153,16 +161,24 @@ impl Plot {
         };
 
         let plot_file_name = plot_file.to_string();
-        let sector_size = get_sector_size(path.to_str().unwrap());
-        if use_direct_io && sector_size / 64 > nonces {
-            warn!(
-                "not enough nonces for using direct io: plot={}",
-                plot_file_name
-            );
+        let path_str = path.to_string_lossy();
+        let sector_size = get_sector_size(&path_str);
+        if use_direct_io && (sector_size == 0 || sector_size / 64 > nonces) {
+            if sector_size == 0 {
+                warn!(
+                    "unknown sector size for {}, disabling direct I/O",
+                    plot_file_name
+                );
+            } else {
+                warn!(
+                    "not enough nonces for using direct io: plot={}",
+                    plot_file_name
+                );
+            }
             use_direct_io = false;
         }
 
-        let file_path = path.clone().into_os_string().into_string().unwrap();
+        let file_path = path.to_string_lossy().into_owned();
         Ok(Plot {
             meta: Meta {
                 account_id,
@@ -253,6 +269,17 @@ impl Plot {
 
         let offset = self.read_offset;
         if !self.dummy {
+            if bytes_to_read > bs.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "plot {}: read buffer too small ({} < {})",
+                        self.meta.name,
+                        bs.len(),
+                        bytes_to_read
+                    ),
+                ));
+            }
             if offset == 0 {
                 self.fh
                     .seek(SeekFrom::Start(self.seek_base + self.align_offset))?;
@@ -299,6 +326,17 @@ impl Plot {
 
         let offset = self.read_offset;
         if !self.dummy {
+            if bytes_to_read > bs.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "plot {}: read buffer too small ({} < {})",
+                        self.meta.name,
+                        bs.len(),
+                        bytes_to_read
+                    ),
+                ));
+            }
             if offset == 0 {
                 self.fh
                     .seek(SeekFrom::Start(self.seek_base + self.align_offset))
