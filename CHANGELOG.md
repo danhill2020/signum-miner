@@ -42,6 +42,20 @@
 
 ### Added (capacity stability)
 
+- `early_submit_deadline` (default 600 s): with `submit_only_best`, a
+  deadline short enough to expire before the round ends is submitted as soon
+  as it is found; the best is still sent at round end, without repeating an
+  already-sent nonce.
+- A pool reporting a target deadline of 0 is treated as "no limit" instead
+  of "never submit".
+- Readers check for a new block before taking a buffer, so a new block no
+  longer costs one extra chunk read per drive.
+- The disk health report shows each drive's last round time and speed and
+  names the slowest drive; the metrics report shows the longest round and
+  how many rounds were interrupted by the next block.
+- Start-up warnings when `hdd_reader_thread_count` or the number of read
+  buffers is lower than the number of drives.
+
 - `plot_missing_grace` (default 1 h): plots that a rescan cannot find keep
   their place in the capacity and are retried every round until the grace
   period expires. This replaces the previous "debounce" heuristics and stops
@@ -55,6 +69,23 @@
   built-in benchmark modes for finding the bottleneck.
 - Buffered reads (the fallback for filesystems without direct I/O) advise
   the kernel to read ahead and drop the pages afterwards.
+
+### Added (plotter and GUI)
+
+- `signum-plotter`, a PoC2 plotter built alongside the miner. CPU plotting
+  on all cores (rayon) and, with `--features opencl`, GPU plotting with one
+  OpenCL work-item per nonce (`--list-devices`, `--gpu P:D`). Generation and
+  writing overlap, the file is written scoop-major directly (no sort pass),
+  is preallocated, and is removed if the run fails. `--size-gb` or
+  `--nonces`, `--start-nonce` defaults to the end of the account's existing
+  plots in the directory, `--bench` measures the rate without writing.
+  Both paths are verified byte for byte against the independent reference
+  generator in the tests.
+- GUI: a Plotter page (account, directory picker, size, CPU threads or a
+  detected OpenCL device, progress/rate/ETA, benchmark), a round-time chart
+  of the last 120 rounds, a drives table with health from the disk health
+  report, `Ctrl+S` to save, an "Add folder…" button for plot directories,
+  and remembered window size, page, config file and plotter settings.
 
 ### Changed
 

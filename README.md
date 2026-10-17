@@ -25,6 +25,8 @@ Signum is the world's first truly sustainable blockchain — and the Signum Mine
 - Multi-threaded & high performance I/O
 - Integrated plot reader, CPU miner & buffer pipeline
 - Full async + **Tokio** + **crossbeam** architecture
+- Built-in **PoC2 plotter** (`signum-plotter`) for the CPU or, with the `opencl` feature, a GPU
+- Desktop **GUI** in Signum colours: dashboard, config editor, plotter and logs
 
 ## 🧰 **Feature Overview**
 
@@ -116,6 +118,10 @@ Settings worth knowing:
   is complete rather than every improvement as it is found. If the next block
   arrives before the round is complete, the best deadline found so far is
   submitted anyway.
+- `early_submit_deadline` (default 600 s): with `submit_only_best`, a deadline
+  this short (or shorter than about twice the previous round time) is sent the
+  moment it is found, because waiting for the end of the round could let it
+  expire. The best deadline is still sent at the end of the round.
 - `show_progress`: the progress bar is only drawn on an interactive terminal; under
   systemd or with output redirected to a file it is switched off automatically.
 
@@ -162,7 +168,7 @@ cpu_threads: 0              # all 4 cores hash
 cpu_worker_task_count: 4
 io_buffer_size: 16777216    # 16 MiB per read keeps USB queues full
 hdd_use_direct_io: true     # no page-cache churn on 4-8 GB of RAM
-hdd_wakeup_after: 240       # keep the bays spinning between blocks
+hdd_wakeup_after: 120       # keep the bays spinning between blocks
 show_progress: false        # headless
 logfile_log_level: off      # journald captures stdout
 ```
@@ -174,9 +180,14 @@ Notes:
 - Format drives as ext4 or exFAT. NTFS via `ntfs-3g` works but only with
   buffered reads, which the miner falls back to automatically.
 - Mount the bays through `/etc/fstab` with stable identifiers (`UUID=` or
-  `LABEL=`) so `/mnt/bayN` always points at the same disk. The included
-  [`contrib/signum-miner.service`](./contrib/signum-miner.service) shows how to
-  make systemd wait for those mounts and restart the miner if it ever stops.
+  `LABEL=`) so `/mnt/bayN` always points at the same disk, and add
+  `nofail,x-systemd.automount` to the options so a bay that resets or is
+  re-plugged is mounted again the next time the miner touches it, without a
+  reboot or a restart:
+  `UUID=... /mnt/bay1 ext4 defaults,noatime,nofail,x-systemd.automount 0 2`.
+  The included [`contrib/signum-miner.service`](./contrib/signum-miner.service)
+  shows how to make systemd wait for those mounts and restart the miner if it
+  ever stops.
 - Many enclosures have their own idle spin-down timer; `hdd_wakeup_after`
   issues a real read (not just a seek) so they stay awake. If an enclosure still
   sleeps, lower the value or disable its timer with `hdparm -B 255` /
@@ -203,7 +214,13 @@ likelihood:
 2. **Drives disappearing.** A USB reset or a late mount used to drop the
    bay from the scan; now it stays in the capacity for `plot_missing_grace`
    and is retried every round. The 5-minute disk health report shows which
-   drive is producing read errors.
+   drive is producing read errors, how long each drive took for its last
+   round and which one was slowest: the round cannot finish before the
+   slowest bay does, so that is the one to look at.
+4. **Good deadlines arriving late.** With `submit_only_best` the best
+   deadline used to be sent only after the whole farm was scanned; a
+   deadline shorter than the scan had already expired by then. Short
+   deadlines are now sent immediately (`early_submit_deadline`).
 3. **Plots skipped or rejected.** Fixed in 2.1.0 (wrong nonce for every
    scoop but 0, direct I/O alignment, rounds that never completed). A plot
    the miner cannot load is logged at start-up with the reason.
@@ -240,7 +257,18 @@ box.
   and logging. Saving keeps the comments and order of your `config.yaml`;
   *Validate* runs `signum-miner --check` on what is on screen before you
   save; the *Raw YAML* tab is there for anything unusual.
+- **Plotter** – fills new drives from the GUI: account, directory (pick one
+  of the configured plot directories or browse), size, CPU threads or an
+  OpenCL GPU detected from `signum-plotter --list-devices`, with a progress
+  bar, rate, ETA and a benchmark mode. The next free nonce is worked out from
+  the plots already in the directory, so plots never overlap.
 - **Logs** – the miner output with level colouring and a level filter.
+
+The dashboard keeps a chart of the last 120 round times, lists every drive
+with its file count, size, bus type and health (error rate, last round time
+and speed from the miner's disk health report), and the window remembers
+its size, page, config file and plotter settings between runs
+(`~/.config/signum-miner/ui.json`). `Ctrl+S` saves the config.
 
 ```bash
 pip install -r requirements.txt
@@ -253,6 +281,51 @@ The UI looks for the `signum-miner` binary next to `miner_ui.py`, then in
 with Tk (`sudo apt-get install python3-tk` on Debian/Raspberry Pi OS).
 
 ![Config](docs/ui-config.png)
+
+![Plotter](docs/ui-plotter.png)
+
+### Plotting (signum-plotter)
+
+`cargo build --release` also builds `signum-plotter`, which writes PoC2 plot
+files in the `<account>_<start nonce>_<nonces>` format the miner reads. The
+output is verified byte for byte against an independent reference generator
+in the test suite, for the CPU and the GPU path.
+
+```bash
+# 4 TB plot (1 GB = 4096 nonces), continuing after this account's existing
+# plots in the directory, on all CPU cores
+signum-plotter --id 10282355196851764065 --path /mnt/bay1/plots --size-gb 4000
+
+# Pick the start nonce and nonce count yourself, 4 threads
+signum-plotter -i 10282355196851764065 -p /mnt/bay1/plots -s 0 -n 16777216 -t 4
+
+# GPU plotting needs a build with OpenCL support
+cargo build --release --features opencl
+signum-plotter --list-devices                   # 0:0  NVIDIA CUDA / GeForce ... (46 compute units, 8.0 GiB)
+signum-plotter -i 10282355196851764065 -p /mnt/bay1/plots --size-gb 4000 --gpu 0:0
+
+# How fast is this machine? Generates without writing anything.
+signum-plotter -i 1 -p . --nonces 65536 --bench --gpu 0:0
+```
+
+Notes:
+
+- One file per run. The plotter preallocates the file, writes it scoop by
+  scoop (no re-sorting pass) and removes it again if the run fails, so the
+  miner never sees a half-written plot. Check free space first: 256 KiB per
+  nonce.
+- `--batch` sets how many nonces are generated per round trip (default 512
+  on the CPU, 2048 on a GPU); memory use is about `batch × 512 KiB`. A
+  bigger batch keeps a large GPU busier.
+- A GPU is only faster when the drive can keep up: a USB 3 bay writes at
+  100–200 MB/s, i.e. 25–45k nonces/min, which a mid-range GPU easily
+  exceeds. The `done:` line reports the achieved MB/s.
+- The Raspberry Pi 5's VideoCore GPU has no OpenCL driver, so on the Pi the
+  plotter uses the four CPU cores (expect a few thousand nonces/min). For
+  large farms plot on a PC with a GPU and move the drives, or let the Pi plot
+  in the background while it mines (`--threads 2` leaves cores for the miner).
+- Plots made by other PoC2 plotters (the Signum `plotter` / `engraver`)
+  are compatible either way.
 
 ---
 
@@ -283,7 +356,8 @@ cargo build --release --no-default-features --features simd_avx512f
 # Portable build without SIMD (slow, for unusual CPUs)
 cargo build --release --no-default-features
 
-# OpenCL GPU support
+# OpenCL GPU support for the miner and the plotter (needs an OpenCL SDK /
+# ICD loader, e.g. ocl-icd-opencl-dev on Debian)
 cargo build --release --features opencl
 
 # Cross-compile for a Raspberry Pi from an x86-64 Linux box
@@ -305,8 +379,13 @@ cargo test --release
 The test suite includes an independent PoC2 plot generator and deadline
 oracle (built on the reference C Shabal implementation) that verifies the
 miner maps every byte on disk to the right nonce and that the compiled SIMD
-backend agrees with the reference on real plot data. CI runs it for AVX2,
-SSE2, the portable backend and, under QEMU, for the aarch64 NEON build.
+backend agrees with the reference on real plot data. The same oracle checks
+`signum-plotter`: the pipeline test writes a plot and compares it with the
+reference plot in `test_data`, and with `--features opencl` the GPU kernel is
+compared nonce by nonce with the CPU generator on whatever OpenCL device is
+present (CI uses the `pocl` CPU runtime). CI runs it for AVX2, SSE2, the
+portable backend, the OpenCL build and, under QEMU, for the aarch64 NEON
+build.
 
 ## 📜 License
 
