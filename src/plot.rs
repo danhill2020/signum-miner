@@ -61,8 +61,12 @@ pub fn parse_plot_name(name: &str) -> Option<(u64, u64, u64)> {
 }
 
 pub struct Plot {
+    /// `meta.nonces` is the number of nonces that are *mined*: the whole
+    /// file, or the finished part of an unfinished plot.
     pub meta: Meta,
     pub path: PathBuf,
+    /// Nonces the file is laid out for (its name); scoop regions are this long.
+    file_nonces: u64,
     /// `None` for a plot that is currently unreadable (drive went away); it is
     /// reopened at the start of every round and simply skipped until it is back.
     fh: Option<File>,
@@ -72,6 +76,45 @@ pub struct Plot {
     read_offset: u64,
     use_direct_io: bool,
     dummy: bool,
+}
+
+/// Trailer that plotters (engraver, signum-plotter, ours) keep in the last 8
+/// bytes of a plot: nonces written so far (u32 LE) followed by this magic.
+const RESUME_MAGIC: [u8; 4] = [0xAF, 0xFE, 0xAF, 0xFE];
+
+/// `Some(written)` when the file is an unfinished plot, `None` when it is
+/// complete (or carries no marker).
+///
+/// The official plotter does not update the marker after its last buffer,
+/// so a marker short of the full count is only trusted when the nonce it
+/// points at is still unwritten (preallocated space reads as zeros) and the
+/// last nonce is too.
+fn unfinished_nonces(path: &Path, nonces: u64) -> io::Result<Option<u64>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::End(-8))?;
+    let mut trailer = [0u8; 8];
+    f.read_exact(&mut trailer)?;
+    if trailer[4..] != RESUME_MAGIC {
+        return Ok(None);
+    }
+    let written = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]) as u64;
+    if written >= nonces {
+        return Ok(None);
+    }
+    let mut scoop = [0u8; SCOOP_SIZE as usize];
+    let mut is_blank = |nonce: u64| -> io::Result<bool> {
+        f.seek(SeekFrom::Start(nonce * SCOOP_SIZE))?;
+        f.read_exact(&mut scoop)?;
+        Ok(scoop.iter().all(|&b| b == 0))
+    };
+    if is_blank(written)? && is_blank(nonces - 1)? {
+        Ok(Some(written))
+    } else {
+        // Written past the marker: a finished plot whose plotter stopped
+        // updating it (or one still being written; the next rescan sees more).
+        Ok(None)
+    }
 }
 
 cfg_if! {
@@ -178,6 +221,24 @@ impl Plot {
             )));
         }
 
+        let file_nonces = nonces;
+        let nonces = match unfinished_nonces(path, nonces)? {
+            Some(0) => {
+                return Err(From::from(format!(
+                "{} is an unfinished plot with nothing written yet; finish it with signum-plotter",
+                plot_file
+            )))
+            }
+            Some(done) => {
+                warn!(
+                    "{} is an unfinished plot: {} of {} nonces are written; mining that part, resume it with signum-plotter (same account, start nonce and size)",
+                    plot_file, done, nonces
+                );
+                done
+            }
+            None => nonces,
+        };
+
         let mut use_direct_io = use_direct_io;
         if use_direct_io && nonces * SCOOP_SIZE < DIRECT_IO_ALIGNMENT {
             warn!(
@@ -210,8 +271,9 @@ impl Plot {
                 nonces,
                 name: plot_file.to_string(),
             },
-            fh: Some(fh),
             path: path.to_path_buf(),
+            file_nonces,
+            fh: Some(fh),
             scoop_base: 0,
             read_offset: 0,
             use_direct_io,
@@ -223,6 +285,7 @@ impl Plot {
     /// its place (and its capacity) and is retried every round.
     pub fn placeholder(meta: Meta, path: PathBuf, use_direct_io: bool, dummy: bool) -> Plot {
         Plot {
+            file_nonces: meta.nonces,
             meta,
             path,
             fh: None,
@@ -242,9 +305,15 @@ impl Plot {
         self.use_direct_io
     }
 
-    /// Size in bytes of one scoop across all nonces of this plot.
+    /// Size in bytes of one scoop across the mined nonces of this plot.
     fn scoop_bytes(&self) -> u64 {
         self.meta.nonces * SCOOP_SIZE
+    }
+
+    /// Distance in bytes between the starts of two scoop regions (the file's
+    /// layout, which an unfinished plot already has in full).
+    fn scoop_stride(&self) -> u64 {
+        self.file_nonces * SCOOP_SIZE
     }
 
     fn reopen(&mut self) -> io::Result<()> {
@@ -281,7 +350,7 @@ impl Plot {
     /// alignment logic can be tested without a filesystem that supports
     /// direct I/O.
     fn position(&mut self, scoop: u32) {
-        self.scoop_base = u64::from(scoop) * self.scoop_bytes();
+        self.scoop_base = u64::from(scoop) * self.scoop_stride();
         self.read_offset = 0;
         if self.use_direct_io {
             // Direct I/O needs an aligned file offset.  Skip forward to the

@@ -216,6 +216,8 @@ class NewParsingTests(unittest.TestCase):
         self.assertEqual((p.percent, p.done, p.total, p.output_path), (100.0, 4096, 4096, "/mnt/bay1/plots/5_0_4096"))
         p.feed("error: plotting failed: No space left on device (os error 28)")
         self.assertEqual(p.error, "plotting failed: No space left on device (os error 28)")
+        p.feed("resuming: 1024 of 4096 nonces were already on disk")
+        self.assertEqual(p.resumed_from, 1024)
 
     def test_parse_device_list(self):
         from miner_ui import parse_device_list
@@ -274,14 +276,16 @@ class NewParsingTests(unittest.TestCase):
             plot_device=Var("GPU 0:1  Some GPU (32 compute units, 8.0 GiB)"),
             plot_threads=Var("3"),
             plot_mem=Var("2"),
+            plot_low_priority=Var(True),
         )
         cmd = miner_ui.MinerUI._plotter_command(app, bench=True)
         self.assertEqual(
             cmd,
-            ["/opt/signum-plotter", "--id", "1234567890123456789", "--path", plot_dir, "--nonces", "2048", "--start-nonce", "4096", "--gpu", "0:1", "--mem", "2", "--bench"],
+            ["/opt/signum-plotter", "--id", "1234567890123456789", "--path", plot_dir, "--nonces", "2048", "--start-nonce", "4096", "--gpu", "0:1", "--mem", "2", "--low-priority", "--bench"],
         )
         app.plot_device = Var("CPU")
         app.plot_mem = Var("")
+        app.plot_low_priority = Var(False)
         cmd = miner_ui.MinerUI._plotter_command(app, bench=False)
         self.assertEqual(cmd[-4:], ["--start-nonce", "4096", "--threads", "3"])
         os.rmdir(plot_dir)

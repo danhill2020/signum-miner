@@ -331,21 +331,49 @@ signum-plotter -i 1 -p . --nonces 65536 --bench --gpu 0:0
 # Bigger write buffers (8 GB of RAM instead of a quarter of the machine's):
 # every scoop is written in 1 MiB pieces, the best case for hard drives
 signum-plotter -i 10282355196851764065 -p /mnt/bay1/plots --size-gb 4000 --mem 8
+
+# Fill the rest of the drive, at low priority while the miner keeps running
+signum-plotter -i 10282355196851764065 -p /mnt/bay1/plots --fill --low-priority
+
+# Interrupted (Ctrl-C, power cut)?  Run the same command again: it continues
+# from where it stopped.  Works for plots started by the official
+# signum-plotter / engraver too, and the other way round.
+signum-plotter -i 10282355196851764065 -p /mnt/bay1/plots --size-gb 4000
 ```
 
 Notes:
 
 - One file per run. The plotter really preallocates the file (`fallocate`,
-  so it is not fragmented by the 4096 interleaved write streams), writes it
-  scoop by scoop (no re-sorting pass) and removes it again if the run fails,
-  so the miner never sees a half-written plot. Check free space first:
-  256 KiB per nonce.
+  so it is not fragmented by the 4096 interleaved write streams) and writes
+  it scoop by scoop (no re-sorting pass). Check free space first: 256 KiB
+  per nonce, or use `--fill`.
+- **Resumable.** Like the official plotter, the last 8 bytes of the file
+  hold the number of nonces written so far (updated after every chunk). An
+  interrupted run continues when started again with the same account, start
+  nonce and size, whichever plotter wrote it. The miner reads the same
+  marker: an unfinished plot is mined up to the written part with a warning
+  instead of submitting garbage deadlines for the empty rest, so a plot in
+  progress can sit in the plot directory.
+- **Direct I/O.** Data is written with `O_DIRECT` on Linux, so a terabyte
+  plot does not go through the page cache and push everything else out
+  (`--no-direct-io` to write buffered; filesystems that refuse `O_DIRECT`
+  fall back automatically). This needs 4 KiB aligned writes, so nonce
+  counts are rounded down to a multiple of 64 unless `--exact`; the miner
+  likes that too, because every scoop region then starts on a 4 KiB
+  boundary and its own direct I/O reads need no alignment skip.
+- `--low-priority` runs the hashing threads niced so a miner on the same
+  machine keeps its cores (the GUI's Plotter page has this on by default).
 - `--mem` is the RAM for the two write buffers (default: a quarter of the
   machine's RAM, at most 4 GB). Each scoop is written in one piece per
   buffer, so 2 GB buffers mean 256 KiB writes and 8 GB mean 1 MiB writes.
   On a hard drive bigger is faster; on the Pi 5 (8 GB) the default is fine.
 - `--batch` (GPU only) is the number of nonces per kernel launch, by default
   sized to half of the device memory (512 KiB per nonce in flight).
+- Compared with the official `signum-plotter`: same file format, naming and
+  resume marker (its output was compared byte for byte with ours), same
+  direct and double-buffered I/O, memory, thread and priority options, CPU
+  SIMD and OpenCL support. Not implemented: plotting on several GPUs at
+  once, zero-copy buffers for integrated GPUs.
 - A GPU is only faster when the drive can keep up: a USB 3 bay writes at
   100–200 MB/s, i.e. 25–45k nonces/min, which an AVX-512 CPU or any modern
   GPU already exceeds. The `done:` line reports the achieved MB/s.

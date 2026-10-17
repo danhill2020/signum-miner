@@ -88,6 +88,21 @@
   one piece per chunk, so writes are 256 KiB or larger instead of 32 KiB.
   The GUI has a matching memory field.
 
+### Added (plotter parity with the official signum-plotter)
+
+- Resumable plots: the last 8 bytes carry the nonces written so far in the
+  same format as engraver / the official signum-plotter, updated after every
+  chunk, so an interrupted plot continues with either plotter. A file of the
+  right name that is not a resumable plot is refused rather than overwritten.
+- The miner recognises the marker and mines only the written part of an
+  unfinished plot (warning in the log), instead of submitting deadlines
+  computed from unwritten space.
+- Direct I/O writes (`--no-direct-io` to disable, automatic fallback), nonce
+  counts rounded down to multiples of 64 unless `--exact`, `--fill` to plot
+  the free space of a drive, `--low-priority` (GUI: on by default).
+- The official plotter's output for 64 nonces was compared byte for byte
+  with ours: identical apart from the resume trailer.
+
 ### Added (plotter and GUI)
 
 - `signum-plotter`, a PoC2 plotter built alongside the miner. CPU plotting

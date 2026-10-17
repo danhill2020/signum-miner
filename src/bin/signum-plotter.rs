@@ -16,8 +16,8 @@ mod plotter;
 use clap::{Arg, ArgAction, Command};
 use plotter::poc2::NONCE_SIZE;
 use plotter::{
-    chunk_for_memory, default_chunk_nonces, format_duration, next_free_nonce, CpuGenerator,
-    NonceGenerator, PlotJob, Progress,
+    chunk_for_memory, default_chunk_nonces, format_duration, free_space, next_free_nonce,
+    set_low_priority, CpuGenerator, NonceGenerator, PlotJob, Progress, NONCES_PER_BLOCK,
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -76,6 +76,31 @@ fn main() {
                 .long("size-gb")
                 .value_name("GB")
                 .help("Plot size in GB (1 GB = 4096 nonces); alternative to --nonces"),
+        )
+        .arg(
+            Arg::new("fill")
+                .long("fill")
+                .action(ArgAction::SetTrue)
+                .help("Plot size = all free space in DIR (minus a small reserve); alternative to --nonces"),
+        )
+        .arg(
+            Arg::new("exact")
+                .long("exact")
+                .action(ArgAction::SetTrue)
+                .help("Keep the nonce count as given instead of rounding it down to a multiple of 64 (which keeps every scoop 4 KiB aligned for direct I/O)"),
+        )
+        .arg(
+            Arg::new("no_direct_io")
+                .long("no-direct-io")
+                .action(ArgAction::SetTrue)
+                .help("Write through the page cache instead of with direct I/O"),
+        )
+        .arg(
+            Arg::new("low_priority")
+                .long("low-priority")
+                .short('l')
+                .action(ArgAction::SetTrue)
+                .help("Run with low CPU priority (nice), e.g. while the miner runs on the same machine"),
         )
         .arg(
             Arg::new("threads")
@@ -153,13 +178,36 @@ fn main() {
     if !m.get_flag("bench") && !directory.is_dir() {
         fail(&format!("{} is not a directory", directory.display()));
     }
-    let nonces = match (parse_u64(&m, "nonces"), parse_u64(&m, "size")) {
-        (Some(n), _) => n,
-        (None, Some(gb)) => gb * 4096,
-        (None, None) => fail("give the plot size with --nonces or --size-gb"),
+    if m.get_flag("low_priority") && !set_low_priority() {
+        eprintln!("warning: could not lower the process priority");
+    }
+    let mut nonces = match (
+        parse_u64(&m, "nonces"),
+        parse_u64(&m, "size"),
+        m.get_flag("fill"),
+    ) {
+        (Some(n), _, _) => n,
+        (None, Some(gb), _) => gb * 4096,
+        (None, None, true) => {
+            let free = free_space(&directory)
+                .unwrap_or_else(|| fail("cannot determine the free space of the directory"));
+            // Leave 64 MiB so the filesystem keeps some slack.
+            free.saturating_sub(64 << 20) / NONCE_SIZE as u64
+        }
+        (None, None, false) => fail("give the plot size with --nonces, --size-gb or --fill"),
     };
+    if !m.get_flag("exact") && !m.get_flag("bench") {
+        let rounded = nonces / NONCES_PER_BLOCK * NONCES_PER_BLOCK;
+        if rounded != nonces {
+            eprintln!(
+                "rounding {} nonces down to {} (a multiple of {} keeps every scoop region 4 KiB aligned; --exact to keep it)",
+                nonces, rounded, NONCES_PER_BLOCK
+            );
+        }
+        nonces = rounded;
+    }
     if nonces == 0 {
-        fail("the plot needs at least one nonce");
+        fail("the plot needs at least one nonce (64 without --exact)");
     }
     let start_nonce =
         parse_u64(&m, "start").unwrap_or_else(|| next_free_nonce(&directory, account_id));
@@ -220,8 +268,9 @@ fn main() {
         directory,
         chunk,
         dry_run: m.get_flag("bench"),
+        direct_io: !m.get_flag("no_direct_io"),
     };
-    if !job.dry_run {
+    if !job.dry_run && !job.path().exists() {
         let free = free_space(&job.directory);
         let needed = nonces * NONCE_SIZE as u64;
         if let Some(free) = free {
@@ -285,29 +334,66 @@ fn main() {
         let _ = std::io::stderr().flush();
     };
 
+    let mut announced = false;
     let result = plotter::run(&job, generator.as_mut(), |p| {
+        if !announced {
+            announced = true;
+            if p.done > 0 && !quiet && !job.dry_run {
+                // First callback of a resumed plot reports the resume point
+                // plus the first batch; say where we picked up.
+                eprintln!(
+                    "resuming: {} of {} nonces were already on disk",
+                    p.done, p.total
+                );
+            }
+        }
         report(p, p.done == p.total, &mut last_report);
     });
     match result {
-        Ok(path) => {
+        Ok(outcome) => {
+            if outcome.resumed_from >= nonces && !job.dry_run {
+                println!(
+                    "done: {} is already complete ({} nonces), nothing to do",
+                    outcome.path.display(),
+                    nonces
+                );
+                return;
+            }
+            let made = nonces - outcome.resumed_from;
             let secs = started.elapsed().as_secs_f64().max(1e-9);
             println!(
-                "done: {} nonces in {} ({:.0} nonces/min, {:.1} MB/s){}",
-                nonces,
+                "done: {} nonces in {} ({:.0} nonces/min, {:.1} MB/s{}){}",
+                made,
                 format_duration(started.elapsed()),
-                nonces as f64 / secs * 60.0,
-                nonces as f64 * NONCE_SIZE as f64 / secs / 1e6,
+                made as f64 / secs * 60.0,
+                made as f64 * NONCE_SIZE as f64 / secs / 1e6,
+                if job.dry_run {
+                    ""
+                } else if outcome.direct_io {
+                    ", direct I/O"
+                } else {
+                    ", buffered I/O"
+                },
                 if job.dry_run {
                     String::new()
                 } else {
-                    format!(" -> {}", path.display())
+                    format!(" -> {}", outcome.path.display())
                 }
             );
         }
         Err(e) => {
             if !job.dry_run {
-                // A half-written plot would be mined as if complete; remove it.
-                let _ = std::fs::remove_file(job.path());
+                match plotter::writer::read_resume_marker(&job.path()) {
+                    // Nothing written yet: no point keeping the file.
+                    Ok(Some(0)) => {
+                        let _ = std::fs::remove_file(job.path());
+                    }
+                    Ok(Some(done)) => eprintln!(
+                        "{} nonces are on disk; run the same command again to resume",
+                        done
+                    ),
+                    _ => {}
+                }
             }
             fail(&format!("plotting failed: {}", e));
         }
@@ -327,22 +413,4 @@ fn parse_device(spec: &str) -> (usize, usize) {
             spec
         )),
     }
-}
-
-#[cfg(unix)]
-fn free_space(dir: &std::path::Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c = CString::new(dir.as_os_str().as_bytes()).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: valid C string and out-pointer.
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    Some(st.f_bavail as u64 * st.f_frsize as u64)
-}
-
-#[cfg(not(unix))]
-fn free_space(_dir: &std::path::Path) -> Option<u64> {
-    None
 }
