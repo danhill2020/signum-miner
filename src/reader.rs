@@ -127,6 +127,11 @@ impl Reader {
         self.drive_id_to_plots.len()
     }
 
+    /// Current plots per drive (shared handles, cheap to clone).
+    pub fn drives(&self) -> DriveMap {
+        self.drive_id_to_plots.clone()
+    }
+
     pub fn start_reading(
         &mut self,
         height: u64,

@@ -91,6 +91,11 @@ pub struct Cfg {
     #[serde(default = "default_capacity_check_interval")]
     pub capacity_check_interval: u64,
 
+    /// Seconds a plot that vanished (unplugged bay, USB reset) stays in the
+    /// reported capacity and keeps being retried before it is dropped.
+    #[serde(default = "default_plot_missing_grace")]
+    pub plot_missing_grace: u64,
+
     #[serde(default = "default_console_log_level")]
     pub console_log_level: String,
 
@@ -149,6 +154,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "send_proxy_details",
     "additional_headers",
     "capacity_check_interval",
+    "plot_missing_grace",
     "console_log_level",
     "logfile_log_level",
     "logfile_max_count",
@@ -271,6 +277,10 @@ fn default_send_proxy_details() -> bool {
 
 fn default_capacity_check_interval() -> u64 {
     21600
+}
+
+fn default_plot_missing_grace() -> u64 {
+    3600
 }
 
 fn default_additional_headers() -> HashMap<String, String> {

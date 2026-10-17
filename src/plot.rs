@@ -63,7 +63,9 @@ pub fn parse_plot_name(name: &str) -> Option<(u64, u64, u64)> {
 pub struct Plot {
     pub meta: Meta,
     pub path: PathBuf,
-    fh: File,
+    /// `None` for a plot that is currently unreadable (drive went away); it is
+    /// reopened at the start of every round and simply skipped until it is back.
+    fh: Option<File>,
     /// Byte offset of the current scoop's region inside the file.
     scoop_base: u64,
     /// Bytes of the current scoop already handed out (including the alignment skip).
@@ -75,6 +77,7 @@ pub struct Plot {
 cfg_if! {
     if #[cfg(unix)] {
         use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        use std::os::unix::io::AsRawFd;
 
         pub fn open_using_direct_io<P: AsRef<Path>>(path: P) -> io::Result<File> {
             OpenOptions::new()
@@ -84,11 +87,30 @@ cfg_if! {
         }
 
         pub fn open<P: AsRef<Path>>(path: P) -> io::Result<File> {
-            OpenOptions::new().read(true).open(path)
+            let fh = OpenOptions::new().read(true).open(path)?;
+            // Buffered fallback: tell the kernel the access is sequential so
+            // it reads ahead aggressively (USB drives need a full queue).
+            unsafe {
+                libc::posix_fadvise(fh.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            }
+            Ok(fh)
         }
 
         fn read_exact_at(fh: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
             fh.read_exact_at(buf, offset)
+        }
+
+        /// After a buffered read, drop the pages again: scoop data is never
+        /// re-read, and on a Pi the page cache is better spent elsewhere.
+        fn drop_cache(fh: &File, offset: u64, len: usize) {
+            unsafe {
+                libc::posix_fadvise(
+                    fh.as_raw_fd(),
+                    offset as libc::off_t,
+                    len as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
         }
     } else {
         use std::os::windows::fs::{FileExt, OpenOptionsExt};
@@ -129,6 +151,8 @@ cfg_if! {
             }
             Ok(())
         }
+
+        fn drop_cache(_fh: &File, _offset: u64, _len: usize) {}
     }
 }
 
@@ -186,13 +210,32 @@ impl Plot {
                 nonces,
                 name: plot_file.to_string(),
             },
-            fh,
+            fh: Some(fh),
             path: path.to_path_buf(),
             scoop_base: 0,
             read_offset: 0,
             use_direct_io,
             dummy,
         })
+    }
+
+    /// A plot that was seen before but cannot be opened right now.  It keeps
+    /// its place (and its capacity) and is retried every round.
+    pub fn placeholder(meta: Meta, path: PathBuf, use_direct_io: bool, dummy: bool) -> Plot {
+        Plot {
+            meta,
+            path,
+            fh: None,
+            scoop_base: 0,
+            read_offset: 0,
+            use_direct_io,
+            dummy,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_open(&self) -> bool {
+        self.fh.is_some()
     }
 
     pub fn uses_direct_io(&self) -> bool {
@@ -208,7 +251,7 @@ impl Plot {
         if self.use_direct_io {
             match open_using_direct_io(&self.path) {
                 Ok(fh) => {
-                    self.fh = fh;
+                    self.fh = Some(fh);
                     return Ok(());
                 }
                 Err(e) => {
@@ -220,7 +263,7 @@ impl Plot {
                 }
             }
         }
-        self.fh = open(&self.path)?;
+        self.fh = Some(open(&self.path)?);
         Ok(())
     }
 
@@ -275,7 +318,11 @@ impl Plot {
 
         if !self.dummy && bytes_to_read > 0 {
             let offset = self.scoop_base + self.read_offset;
-            if let Err(e) = read_exact_at(&self.fh, &mut bs[..bytes_to_read], offset) {
+            let fh = self
+                .fh
+                .as_ref()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "plot file is not open"))?;
+            if let Err(e) = read_exact_at(fh, &mut bs[..bytes_to_read], offset) {
                 if self.use_direct_io && e.kind() == io::ErrorKind::InvalidInput {
                     // The filesystem accepted O_DIRECT on open but rejects the
                     // transfer (FUSE, some network filesystems).  Retry buffered.
@@ -284,11 +331,15 @@ impl Plot {
                         self.meta.name, e
                     );
                     self.use_direct_io = false;
-                    self.fh = open(&self.path)?;
-                    read_exact_at(&self.fh, &mut bs[..bytes_to_read], offset)?;
+                    let fh = open(&self.path)?;
+                    read_exact_at(&fh, &mut bs[..bytes_to_read], offset)?;
+                    drop_cache(&fh, offset, bytes_to_read);
+                    self.fh = Some(fh);
                 } else {
                     return Err(e);
                 }
+            } else if !self.use_direct_io {
+                drop_cache(fh, offset, bytes_to_read);
             }
         }
         self.read_offset += bytes_to_read as u64;
@@ -307,7 +358,8 @@ impl Plot {
         let len = min(DIRECT_IO_ALIGNMENT, self.meta.nonces * NONCE_SIZE - addr) as usize;
         let mut buf = AlignedBuffer::new(DIRECT_IO_ALIGNMENT as usize);
         self.reopen()?;
-        read_exact_at(&self.fh, &mut buf[..len], addr)
+        let fh = self.fh.as_ref().expect("reopen sets the file handle");
+        read_exact_at(fh, &mut buf[..len], addr)
     }
 }
 
@@ -423,6 +475,31 @@ mod tests {
         let (bytes, start_nonce, _) = plot.read(&mut buf).unwrap();
         assert_eq!((bytes, start_nonce), (4096, 0));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn placeholder_plot_fails_prepare_until_file_exists() {
+        let dir = std::env::temp_dir().join(format!("signum-miner-ph-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("7_0_8");
+        let meta = Meta {
+            account_id: 7,
+            start_nonce: 0,
+            nonces: 8,
+            name: "7_0_8".into(),
+        };
+        let mut plot = Plot::placeholder(meta, path.clone(), false, false);
+        assert!(!plot.is_open());
+        assert!(plot.prepare(3).is_err());
+        let mut buf = AlignedBuffer::new(512);
+        assert!(plot.read(&mut buf).is_err());
+
+        std::fs::copy(test_plot_path(), &path).unwrap();
+        plot.prepare(3).expect("prepare once the file is back");
+        assert!(plot.is_open());
+        let (bytes, start_nonce, finished) = plot.read(&mut buf).unwrap();
+        assert_eq!((bytes, start_nonce, finished), (512, 0, true));
         std::fs::remove_dir_all(&dir).ok();
     }
 

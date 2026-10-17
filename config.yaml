@@ -38,6 +38,9 @@ target_deadline: 31536000             # default 31536000 (1 year)
 get_mining_info_interval: 3000        # default 3000ms
 capacity_check_interval: 21600        # default 21600s; rescans every 60s instead while a
                                       # plot dir is missing/empty or had read errors
+plot_missing_grace: 3600              # default 3600s; a plot that vanished (USB reset,
+                                      # bay unplugged) stays in the capacity and is retried
+                                      # every round for this long before it is dropped
 timeout: 5000                         # default 5000ms
 send_proxy_details: false              # default false
 submit_only_best: true                # default true

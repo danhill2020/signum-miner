@@ -94,7 +94,9 @@ fn fail(msg: &str) -> ! {
     process::exit(1);
 }
 
-#[tokio::main(flavor = "multi_thread")]
+// The async runtime only talks to the pool and schedules rescans; two worker
+// threads are plenty and leave the cores to the hashing pool.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let cmd = Command::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))

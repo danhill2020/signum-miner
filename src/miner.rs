@@ -39,6 +39,11 @@ use tokio_stream::wrappers::ReceiverStream;
 /// (missing directories, read errors, or no plots at all).
 const UNHEALTHY_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Signum blocks arrive roughly every 240 s.  A round that takes longer than
+/// this is at risk of being interrupted by the next block, which costs
+/// submissions and makes the pool underestimate the farm's capacity.
+const ROUND_TIME_WARN: Duration = Duration::from_secs(180);
+
 pub struct Miner {
     plot_dirs: Vec<PathBuf>,
     hdd_use_direct_io: bool,
@@ -55,6 +60,9 @@ pub struct Miner {
     submit_only_best: bool,
     metrics: SharedMetrics,
     disk_health: SharedDiskHealth,
+    plot_missing_grace: Duration,
+    /// Plots that a rescan could not find, and since when.
+    missing_since: Mutex<HashMap<PathBuf, Instant>>,
 }
 
 pub struct State {
@@ -79,7 +87,9 @@ pub struct State {
     scoop: u32,
     first: bool,
     outage: bool,
-    pending_capacity_drop: Option<u64>,
+    /// Best result of the current round per account, held back for
+    /// `submit_only_best`.
+    best_nonce: HashMap<u64, NonceData>,
 }
 
 impl State {
@@ -102,7 +112,7 @@ impl State {
             scanning: false,
             first: true,
             outage: false,
-            pending_capacity_drop: None,
+            best_nonce: HashMap::new(),
         }
     }
 
@@ -143,8 +153,49 @@ impl State {
         self.processed_reader_tasks = 0;
         self.chunks_expected = 0;
         self.chunks_seen = 0;
+        self.best_nonce.clear();
         self.scanning = true;
         true
+    }
+
+    /// The best deadline of the current round for every account that found one.
+    fn best_submissions(&self) -> Vec<Submission> {
+        let mut out: Vec<Submission> = self
+            .best_nonce
+            .values()
+            .filter(|best| best.height == self.height)
+            .map(|best| {
+                let deadline = best.deadline / best.base_target.max(1);
+                Submission::from_nonce(best, deadline, self.generation_signature_bytes)
+            })
+            .collect();
+        out.sort_by_key(|s| s.account_id);
+        out
+    }
+
+    /// Called when a new block arrives while a round is still running: hand
+    /// out the best deadlines found so far so the block is not lost entirely.
+    fn take_interrupted_round(&mut self) -> Vec<Submission> {
+        if !self.scanning {
+            return Vec::new();
+        }
+        let submissions = self.best_submissions();
+        if self.reader_task_count > 0 {
+            warn!(
+                "round for height {} interrupted after {:.0}s with {} of {} drives finished{}",
+                self.height,
+                self.round_started.elapsed().as_secs_f64(),
+                self.processed_reader_tasks,
+                self.reader_task_count,
+                if submissions.is_empty() {
+                    ""
+                } else {
+                    "; submitting the best deadline(s) found so far"
+                }
+            );
+        }
+        self.scanning = false;
+        submissions
     }
 
     /// All drives reported their last chunk and every chunk's result is in.
@@ -233,6 +284,17 @@ impl PlotScan {
     }
 }
 
+fn human_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 7200 {
+        format!("{} h", secs / 3600)
+    } else if secs >= 120 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{} s", secs)
+    }
+}
+
 fn human_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 && bytes % (1024 * 1024) == 0 {
         format!("{} MiB", bytes / 1024 / 1024)
@@ -257,7 +319,9 @@ fn modification_time(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn scan_plots(plot_dirs: &[PathBuf], use_direct_io: bool, dummy: bool) -> PlotScan {
+/// Scan the plot directories.  `verbose` logs every directory at info level
+/// (start-up); rescans log at debug level and the caller summarises.
+fn scan_plots(plot_dirs: &[PathBuf], use_direct_io: bool, dummy: bool, verbose: bool) -> PlotScan {
     let mut drive_id_to_plots: HashMap<String, Vec<Mutex<Plot>>> = HashMap::new();
     let mut global_capacity: u64 = 0;
     let mut scan_had_errors = false;
@@ -315,7 +379,7 @@ fn scan_plots(plot_dirs: &[PathBuf], use_direct_io: bool, dummy: bool) -> PlotSc
             BusType::Unknown => String::new(),
             other => format!(" ({})", other.label()),
         };
-        info!(
+        let line = format!(
             "path={}, files={}, size={:.4} TiB{}{}",
             dir_str,
             num_plots,
@@ -327,6 +391,11 @@ fn scan_plots(plot_dirs: &[PathBuf], use_direct_io: bool, dummy: bool) -> PlotSc
                 ""
             }
         );
+        if verbose {
+            info!("{}", line);
+        } else {
+            debug!("{}", line);
+        }
 
         global_capacity += local_capacity;
         plot_count += num_plots;
@@ -346,11 +415,13 @@ fn scan_plots(plot_dirs: &[PathBuf], use_direct_io: bool, dummy: bool) -> PlotSc
         })
         .collect();
 
-    info!(
-        "plot files loaded: total drives={}, total capacity={:.4} TiB",
-        drives.len(),
-        global_capacity as f64 / 4.0 / 1024.0 / 1024.0
-    );
+    if verbose {
+        info!(
+            "plot files loaded: total drives={}, total capacity={:.4} TiB",
+            drives.len(),
+            global_capacity as f64 / 4.0 / 1024.0 / 1024.0
+        );
+    }
 
     PlotScan {
         drives,
@@ -361,26 +432,88 @@ fn scan_plots(plot_dirs: &[PathBuf], use_direct_io: bool, dummy: bool) -> PlotSc
     }
 }
 
-fn should_apply_capacity_update(
-    old_size: u64,
-    new_size: u64,
-    scan_had_errors: bool,
-    had_empty_plot_dir: bool,
-) -> bool {
-    if new_size >= old_size {
-        return true;
+/// Combine a fresh scan with the plots currently in use.
+///
+/// A plot that the scan did not find is not dropped straight away: USB bays
+/// reset, mounts come back late, and a capacity figure that jumps around with
+/// every hiccup is worse than useless.  Such a plot is kept as a placeholder
+/// (same capacity, retried every round) until it has been missing for
+/// `grace`, and `missing_since` remembers since when.
+fn merge_retained(
+    current: &DriveMap,
+    mut fresh: DriveMap,
+    missing_since: &mut HashMap<PathBuf, Instant>,
+    now: Instant,
+    grace: Duration,
+    use_direct_io: bool,
+    dummy: bool,
+) -> (DriveMap, u64, Vec<PathBuf>, Vec<PathBuf>) {
+    let mut found: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut nonces = 0u64;
+    for plots in fresh.values() {
+        for plot in plots.iter() {
+            let plot = lock_or_recover(plot);
+            found.insert(plot.path.clone());
+            nonces += plot.meta.nonces;
+        }
     }
 
-    // Protect against temporary drive outages or mount hiccups reducing reported capacity.
-    // If the scan had filesystem errors, only accept equal or higher capacity.
-    if scan_had_errors {
-        return false;
+    let mut retained = Vec::new();
+    let mut dropped = Vec::new();
+    let mut carried: HashMap<String, Vec<Mutex<Plot>>> = HashMap::new();
+    for (drive_id, plots) in current {
+        for plot in plots.iter() {
+            let plot = lock_or_recover(plot);
+            if found.contains(&plot.path) {
+                continue;
+            }
+            let since = *missing_since.entry(plot.path.clone()).or_insert(now);
+            if grace.is_zero() || now.duration_since(since) >= grace {
+                dropped.push(plot.path.clone());
+                continue;
+            }
+            retained.push(plot.path.clone());
+            nonces += plot.meta.nonces;
+            carried
+                .entry(drive_id.clone())
+                .or_default()
+                .push(Mutex::new(Plot::placeholder(
+                    plot.meta.clone(),
+                    plot.path.clone(),
+                    use_direct_io,
+                    dummy,
+                )));
+        }
+    }
+    missing_since.retain(|path, _| !found.contains(path) && !dropped.contains(path));
+
+    for (drive_id, plots) in carried {
+        match fresh.remove(&drive_id) {
+            Some(existing) => {
+                // Arc is unique here: the scan just created it.
+                let mut all = Arc::try_unwrap(existing).unwrap_or_else(|arc| {
+                    arc.iter()
+                        .map(|p| {
+                            let p = lock_or_recover(p);
+                            Mutex::new(Plot::placeholder(
+                                p.meta.clone(),
+                                p.path.clone(),
+                                use_direct_io,
+                                dummy,
+                            ))
+                        })
+                        .collect()
+                });
+                all.extend(plots);
+                fresh.insert(drive_id, Arc::new(all));
+            }
+            None => {
+                fresh.insert(drive_id, Arc::new(plots));
+            }
+        }
     }
 
-    // A mount hiccup can leave a configured plot directory temporarily empty without an I/O error.
-    // Treat large drops (>= 25%) combined with empty plot dirs as suspicious and keep prior capacity.
-    let is_large_drop = old_size > 0 && new_size.saturating_mul(100) < old_size.saturating_mul(75);
-    !(had_empty_plot_dir && is_large_drop)
+    (fresh, nonces * SCOOP_SIZE, retained, dropped)
 }
 
 /// Capacity in GiB as reported to pools/proxies in the `X-Capacity` header.
@@ -390,7 +523,12 @@ fn capacity_gib(round_bytes: u64) -> usize {
 
 impl Miner {
     pub fn new(cfg: Cfg, executor: Handle) -> Result<Miner, String> {
-        let scan = scan_plots(&cfg.plot_dirs, cfg.hdd_use_direct_io, cfg.benchmark_cpu());
+        let scan = scan_plots(
+            &cfg.plot_dirs,
+            cfg.hdd_use_direct_io,
+            cfg.benchmark_cpu(),
+            true,
+        );
         if scan.plot_count == 0 {
             error!(
                 "no plot files found in any configured plot directory; will keep rescanning every {}s",
@@ -639,6 +777,8 @@ impl Miner {
             submit_only_best: cfg.submit_only_best,
             metrics,
             disk_health,
+            plot_missing_grace: Duration::from_secs(cfg.plot_missing_grace),
+            missing_since: Mutex::new(HashMap::new()),
         })
     }
 
@@ -648,75 +788,87 @@ impl Miner {
         let plot_dirs = self.plot_dirs.clone();
         let use_direct_io = self.hdd_use_direct_io;
         let dummy = self.benchmark_cpu;
-        let scan =
-            match tokio::task::spawn_blocking(move || scan_plots(&plot_dirs, use_direct_io, dummy))
-                .await
-            {
-                Ok(scan) => scan,
-                Err(e) => {
-                    error!("capacity rescan task failed: {}", e);
-                    return UNHEALTHY_RESCAN_INTERVAL;
-                }
-            };
-        let next_delay = if scan.is_healthy() {
-            self.capacity_check_interval
-        } else {
-            min(self.capacity_check_interval, UNHEALTHY_RESCAN_INTERVAL)
-        };
-
-        let old_size = lock_or_recover(&self.reader).total_size;
-        let new_size = scan.round_bytes;
-
-        // Decide first, with only the state lock held, then apply with only
-        // the reader lock held.  Never hold both: the mining-info task takes
-        // them in the opposite order.
-        let apply = if should_apply_capacity_update(
-            old_size,
-            new_size,
-            scan.had_errors,
-            scan.had_empty_dir,
-        ) {
-            lock_or_recover(&self.state).pending_capacity_drop = None;
-            true
-        } else if scan.had_errors {
-            warn!(
-                "capacity rescan had filesystem errors and would reduce capacity ({:.4} -> {:.4} TiB). Keeping previous capacity.",
-                tib(old_size),
-                tib(new_size)
-            );
-            false
-        } else {
-            let mut state = lock_or_recover(&self.state);
-            if state.pending_capacity_drop == Some(new_size) {
-                warn!(
-                    "capacity rescan still shows reduced capacity with empty plot directories ({:.4} -> {:.4} TiB). Applying update after confirmation.",
-                    tib(old_size),
-                    tib(new_size)
-                );
-                state.pending_capacity_drop = None;
-                true
-            } else {
-                state.pending_capacity_drop = Some(new_size);
-                warn!(
-                    "capacity rescan saw a large drop with empty plot directories ({:.4} -> {:.4} TiB). Waiting for a second matching rescan before applying.",
-                    tib(old_size),
-                    tib(new_size)
-                );
-                false
+        let scan = match tokio::task::spawn_blocking(move || {
+            scan_plots(&plot_dirs, use_direct_io, dummy, false)
+        })
+        .await
+        {
+            Ok(scan) => scan,
+            Err(e) => {
+                error!("capacity rescan task failed: {}", e);
+                return UNHEALTHY_RESCAN_INTERVAL;
             }
         };
+        let scan_healthy = scan.is_healthy();
 
-        if !apply {
-            return next_delay;
+        // Merge with what is currently mined so a bay that is briefly gone
+        // keeps its capacity.  Only the reader lock is held here; the state
+        // lock is never taken while holding it (the mining-info task nests
+        // them the other way round).
+        let (drives, new_size, retained, dropped, old_size) = {
+            let current = {
+                let reader = lock_or_recover(&self.reader);
+                (reader.drives(), reader.total_size)
+            };
+            let mut missing_since = lock_or_recover(&self.missing_since);
+            let (drives, new_size, retained, dropped) = merge_retained(
+                &current.0,
+                scan.drives,
+                &mut missing_since,
+                Instant::now(),
+                self.plot_missing_grace,
+                self.hdd_use_direct_io,
+                self.benchmark_cpu,
+            );
+            (drives, new_size, retained, dropped, current.1)
+        };
+
+        for path in &dropped {
+            warn!(
+                "dropping {} from the capacity: unreadable for more than {}",
+                path.display(),
+                human_duration(self.plot_missing_grace)
+            );
+        }
+        if !retained.is_empty() {
+            warn!(
+                "{} plot file(s) are unreadable right now and are kept in the capacity for up to {} (retried every round): {}",
+                retained.len(),
+                human_duration(self.plot_missing_grace),
+                retained
+                    .iter()
+                    .take(5)
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
 
-        lock_or_recover(&self.reader).update_plots(scan.drives, new_size, self.benchmark_cpu);
+        let drive_count = drives.len();
+        lock_or_recover(&self.reader).update_plots(drives, new_size, self.benchmark_cpu);
         self.request_handler.update_capacity(capacity_gib(new_size));
 
         if old_size != new_size {
-            info!("updated total capacity: {:.4} TiB", tib(new_size));
+            info!(
+                "updated total capacity: {:.4} TiB ({} plot files, {} drives)",
+                tib(new_size),
+                scan.plot_count + retained.len(),
+                drive_count
+            );
+        } else {
+            debug!(
+                "capacity unchanged: {:.4} TiB ({} plot files, {} drives)",
+                tib(new_size),
+                scan.plot_count + retained.len(),
+                drive_count
+            );
         }
-        next_delay
+
+        if scan_healthy && retained.is_empty() {
+            self.capacity_check_interval
+        } else {
+            min(self.capacity_check_interval, UNHEALTHY_RESCAN_INTERVAL)
+        }
     }
 
     pub async fn run(mut self) {
@@ -779,20 +931,10 @@ impl Miner {
         // --- nonce handling ------------------------------------------------------
         let miner_nonces = miner.clone();
         tokio::spawn(async move {
-            let mut best_nonce_data = NonceData {
-                height: 0,
-                block: 0,
-                base_target: 0,
-                deadline: 0,
-                nonce: 0,
-                reader_task_processed: false,
-                drive_chunks: 0,
-                account_id: 0,
-            };
             ReceiverStream::new(rx_nonce_data)
                 .for_each(move |nonce_data| {
                     let miner = miner_nonces.clone();
-                    let submissions = miner.handle_nonce(nonce_data, &mut best_nonce_data);
+                    let submissions = miner.handle_nonce(nonce_data);
                     async move {
                         for s in submissions {
                             miner.request_handler.submit_nonce(s);
@@ -825,6 +967,15 @@ impl Miner {
                     state.outage = false;
                 }
                 if mining_info.generation_signature != state.generation_signature {
+                    let interrupted = if self.submit_only_best {
+                        state.take_interrupted_round()
+                    } else {
+                        state.scanning = false;
+                        Vec::new()
+                    };
+                    for submission in interrupted {
+                        self.request_handler.submit_nonce(submission);
+                    }
                     if !state.update_mining_info(&mining_info) {
                         return;
                     }
@@ -878,11 +1029,7 @@ impl Miner {
     }
 
     /// Process one hashing result.  Returns the submissions to send, if any.
-    fn handle_nonce(
-        &self,
-        nonce_data: NonceData,
-        best_nonce_data: &mut NonceData,
-    ) -> Vec<Submission> {
+    fn handle_nonce(&self, nonce_data: NonceData) -> Vec<Submission> {
         let mut submissions = Vec::new();
         let mut state = lock_or_recover(&self.state);
 
@@ -909,7 +1056,7 @@ impl Miner {
                 .insert(nonce_data.account_id, deadline);
 
             if self.submit_only_best {
-                *best_nonce_data = nonce_data;
+                state.best_nonce.insert(nonce_data.account_id, nonce_data);
             } else {
                 submissions.push(Submission::from_nonce(
                     &nonce_data,
@@ -937,6 +1084,12 @@ impl Miner {
                         round_time_ms, speed_mibs
                     )
                 );
+                if round_time_ms > ROUND_TIME_WARN.as_millis() as u64 {
+                    warn!(
+                        "round took {:.0}s; Signum blocks arrive about every 240s, so the next block will often interrupt the scan and the pool will underestimate your capacity. Check the speed line above: if it is far below what the drives can deliver, hashing is the bottleneck (more/faster CPU cores); otherwise the drives or the USB link are.",
+                        round_time_ms as f64 / 1000.0
+                    );
+                }
 
                 {
                     let mut metrics = write_or_recover(&self.metrics);
@@ -945,13 +1098,8 @@ impl Miner {
                 }
 
                 // Submit our best one now, if configured that way.
-                if self.submit_only_best && best_nonce_data.height == state.height {
-                    let deadline = best_nonce_data.deadline / best_nonce_data.base_target.max(1);
-                    submissions.push(Submission::from_nonce(
-                        best_nonce_data,
-                        deadline,
-                        state.generation_signature_bytes,
-                    ));
+                if self.submit_only_best {
+                    submissions.extend(state.best_submissions());
                 }
 
                 state.round_started = Instant::now();
@@ -993,29 +1141,149 @@ impl Submission {
 mod tests {
     use super::*;
 
-    #[test]
-    fn capacity_drop_with_scan_errors_is_rejected() {
-        assert!(!should_apply_capacity_update(100, 50, true, false));
+    fn placeholder_map(entries: &[(&str, &str, u64)]) -> DriveMap {
+        let mut map: HashMap<String, Vec<Mutex<Plot>>> = HashMap::new();
+        for (drive, path, nonces) in entries {
+            let meta = crate::plot::Meta {
+                account_id: 1,
+                start_nonce: 0,
+                nonces: *nonces,
+                name: path.to_string(),
+            };
+            map.entry(drive.to_string())
+                .or_default()
+                .push(Mutex::new(Plot::placeholder(
+                    meta,
+                    PathBuf::from(path),
+                    false,
+                    true,
+                )));
+        }
+        map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()
+    }
+
+    fn paths_of(map: &DriveMap) -> Vec<String> {
+        let mut v: Vec<String> = map
+            .values()
+            .flat_map(|plots| plots.iter())
+            .map(|p| lock_or_recover(p).path.display().to_string())
+            .collect();
+        v.sort();
+        v
     }
 
     #[test]
-    fn capacity_drop_without_scan_errors_is_accepted() {
-        assert!(should_apply_capacity_update(100, 50, false, false));
+    fn missing_plots_are_retained_until_grace_expires_then_dropped() {
+        let current = placeholder_map(&[("a", "/a/1_0_100", 100), ("b", "/b/1_100_50", 50)]);
+        let mut missing = HashMap::new();
+        let t0 = Instant::now();
+        let grace = Duration::from_secs(600);
+
+        // Drive b vanished: kept as a placeholder, capacity unchanged.
+        let fresh = placeholder_map(&[("a", "/a/1_0_100", 100)]);
+        let (merged, bytes, retained, dropped) =
+            merge_retained(&current, fresh, &mut missing, t0, grace, false, true);
+        assert_eq!(bytes, 150 * SCOOP_SIZE);
+        assert_eq!(retained, vec![PathBuf::from("/b/1_100_50")]);
+        assert!(dropped.is_empty());
+        assert_eq!(paths_of(&merged), vec!["/a/1_0_100", "/b/1_100_50"]);
+        assert!(missing.contains_key(Path::new("/b/1_100_50")));
+
+        // Still missing after the grace period: dropped, capacity shrinks.
+        let fresh = placeholder_map(&[("a", "/a/1_0_100", 100)]);
+        let (merged, bytes, retained, dropped) =
+            merge_retained(&merged, fresh, &mut missing, t0 + grace, grace, false, true);
+        assert_eq!(bytes, 100 * SCOOP_SIZE);
+        assert!(retained.is_empty());
+        assert_eq!(dropped, vec![PathBuf::from("/b/1_100_50")]);
+        assert_eq!(paths_of(&merged), vec!["/a/1_0_100"]);
+        assert!(missing.is_empty());
     }
 
     #[test]
-    fn capacity_increase_with_scan_errors_is_accepted() {
-        assert!(should_apply_capacity_update(100, 120, true, false));
+    fn plot_that_comes_back_is_forgotten_as_missing() {
+        let current = placeholder_map(&[("a", "/a/1_0_100", 100), ("b", "/b/1_100_50", 50)]);
+        let mut missing = HashMap::new();
+        let t0 = Instant::now();
+        let grace = Duration::from_secs(600);
+        let fresh = placeholder_map(&[("a", "/a/1_0_100", 100)]);
+        let (merged, _, _, _) =
+            merge_retained(&current, fresh, &mut missing, t0, grace, false, true);
+        assert_eq!(missing.len(), 1);
+
+        let fresh = placeholder_map(&[("a", "/a/1_0_100", 100), ("b", "/b/1_100_50", 50)]);
+        let (merged, bytes, retained, dropped) = merge_retained(
+            &merged,
+            fresh,
+            &mut missing,
+            t0 + Duration::from_secs(30),
+            grace,
+            false,
+            true,
+        );
+        assert_eq!(bytes, 150 * SCOOP_SIZE);
+        assert!(retained.is_empty() && dropped.is_empty());
+        assert!(missing.is_empty());
+        assert_eq!(paths_of(&merged), vec!["/a/1_0_100", "/b/1_100_50"]);
     }
 
     #[test]
-    fn large_drop_with_empty_plot_dir_is_rejected() {
-        assert!(!should_apply_capacity_update(100, 70, false, true));
+    fn zero_grace_drops_missing_plots_immediately() {
+        let current = placeholder_map(&[("a", "/a/1_0_100", 100)]);
+        let mut missing = HashMap::new();
+        let (merged, bytes, retained, dropped) = merge_retained(
+            &current,
+            DriveMap::new(),
+            &mut missing,
+            Instant::now(),
+            Duration::ZERO,
+            false,
+            true,
+        );
+        assert!(merged.is_empty());
+        assert_eq!(bytes, 0);
+        assert!(retained.is_empty());
+        assert_eq!(dropped.len(), 1);
     }
 
     #[test]
-    fn small_drop_with_empty_plot_dir_is_accepted() {
-        assert!(should_apply_capacity_update(100, 90, false, true));
+    fn interrupted_round_hands_out_best_so_far() {
+        let mut state = State::new();
+        state.height = 10;
+        state.scanning = true;
+        state.reader_task_count = 3;
+        assert!(state.take_interrupted_round().is_empty());
+        assert!(!state.scanning);
+
+        state.scanning = true;
+        for (account, nonce) in [(5u64, 77u64), (9, 88)] {
+            state.best_nonce.insert(
+                account,
+                NonceData {
+                    height: 10,
+                    block: 1,
+                    base_target: 4,
+                    deadline: 40,
+                    nonce,
+                    reader_task_processed: false,
+                    drive_chunks: 0,
+                    account_id: account,
+                },
+            );
+        }
+        let subs = state.take_interrupted_round();
+        assert_eq!(subs.len(), 2, "one submission per account");
+        assert_eq!(
+            (subs[0].nonce, subs[0].deadline, subs[0].account_id),
+            (77, 10, 5)
+        );
+        assert_eq!((subs[1].nonce, subs[1].account_id), (88, 9));
+        assert!(!state.scanning);
+
+        // A result from an older height is never submitted.
+        state.scanning = true;
+        state.height = 11;
+        assert!(state.take_interrupted_round().is_empty());
     }
 
     #[test]
@@ -1033,6 +1301,13 @@ mod tests {
     }
 
     #[test]
+    fn human_duration_picks_units() {
+        assert_eq!(human_duration(Duration::from_secs(20)), "20 s");
+        assert_eq!(human_duration(Duration::from_secs(3600)), "60 min");
+        assert_eq!(human_duration(Duration::from_secs(7200)), "2 h");
+    }
+
+    #[test]
     fn capacity_header_is_in_gib() {
         // 4096 nonces = 1 GiB of plots.
         assert_eq!(capacity_gib(4096 * SCOOP_SIZE), 1);
@@ -1043,13 +1318,13 @@ mod tests {
     fn scan_plots_loads_test_plot_and_flags_missing_dirs() {
         let test_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data");
         let missing = PathBuf::from("/definitely/not/here");
-        let scan = scan_plots(std::slice::from_ref(&test_dir), false, false);
+        let scan = scan_plots(std::slice::from_ref(&test_dir), false, false, true);
         assert_eq!(scan.plot_count, 1);
         assert_eq!(scan.drives.len(), 1);
         assert_eq!(scan.round_bytes, 8 * SCOOP_SIZE);
         assert!(scan.is_healthy());
 
-        let scan = scan_plots(&[test_dir, missing], false, false);
+        let scan = scan_plots(&[test_dir, missing], false, false, true);
         assert_eq!(scan.plot_count, 1);
         assert!(scan.had_errors);
         assert!(!scan.is_healthy());

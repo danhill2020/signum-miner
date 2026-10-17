@@ -108,8 +108,14 @@ Settings worth knowing:
   rescanned. While a directory is missing, empty or returned errors the miner
   rescans every minute instead, so a bay that is mounted late or re-plugged is
   picked up quickly without a restart.
+- `plot_missing_grace` (default 1 h): a plot file that a rescan cannot find
+  (USB reset, bay unplugged, mount not back yet) keeps its place in the
+  capacity and is retried every round for this long before it is dropped, so
+  the reported capacity does not jump around with every hiccup.
 - `submit_only_best` (default `true`): submit the best deadline once the round
-  is complete rather than every improvement as it is found.
+  is complete rather than every improvement as it is found. If the next block
+  arrives before the round is complete, the best deadline found so far is
+  submitted anyway.
 - `show_progress`: the progress bar is only drawn on an interactive terminal; under
   systemd or with output redirected to a file it is switched off automatically.
 
@@ -177,6 +183,30 @@ Notes:
   `sdparm --clear STANDBY`.
 - Run `./signum-miner --check` after plugging a new bay: it lists every plot
   directory with the bus it is attached to (USB, SATA, NVMe) and the capacity.
+
+### Why does the pool show less capacity than I have?
+
+Pools do not know your plot size; they *estimate* capacity from the quality
+of the deadlines you submit over the last few hundred blocks. Every block
+without a submission, and every block where only part of the farm was
+scanned, lowers that estimate. The things that cause it, in order of
+likelihood:
+
+1. **Rounds taking longer than a block (about 240 s).** Watch the
+   `round finished: roundtime=…` line and the warning the miner prints when
+   a round exceeds 180 s. 97 TB means ~24 GB to read and hash per block; a
+   Pi 5 hashes a few hundred MB/s with NEON, so the round should finish in
+   one to two minutes. If it does not, find the bottleneck with
+   `benchmark_only: 'XPU'` (hashing only, no disk reads) and
+   `benchmark_only: 'I/O'` (disk reads only, no hashing) and compare the
+   reported speeds.
+2. **Drives disappearing.** A USB reset or a late mount used to drop the
+   bay from the scan; now it stays in the capacity for `plot_missing_grace`
+   and is retried every round. The 5-minute disk health report shows which
+   drive is producing read errors.
+3. **Plots skipped or rejected.** Fixed in 2.1.0 (wrong nonce for every
+   scoop but 0, direct I/O alignment, rounds that never completed). A plot
+   the miner cannot load is logged at start-up with the reason.
 
 ### Running as a service (systemd)
 

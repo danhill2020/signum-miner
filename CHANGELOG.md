@@ -40,6 +40,22 @@
 - The carriage return used for the progress bar was also written to log files.
 - The `opencl` feature did not compile.
 
+### Added (capacity stability)
+
+- `plot_missing_grace` (default 1 h): plots that a rescan cannot find keep
+  their place in the capacity and are retried every round until the grace
+  period expires. This replaces the previous "debounce" heuristics and stops
+  the reported capacity from jumping around on USB resets or late mounts.
+- When a new block interrupts an unfinished round, the best deadline found
+  so far is submitted instead of being discarded.
+- `submit_only_best` keeps the best deadline per account, so a farm plotted
+  under several accounts submits for each of them every round (previously
+  only one account's best was sent).
+- A warning when a round takes longer than 180 s, with pointers to the
+  built-in benchmark modes for finding the bottleneck.
+- Buffered reads (the fallback for filesystems without direct I/O) advise
+  the kernel to read ahead and drop the pages afterwards.
+
 ### Changed
 
 - Direct I/O is no longer disabled wholesale for USB drives; instead every
