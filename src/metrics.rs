@@ -1,10 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-#[cfg(not(feature = "async_io"))]
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
-#[cfg(feature = "async_io")]
-use tokio::sync::RwLock;
 
 /// Comprehensive metrics tracking for the miner
 /// Some fields and methods are intentionally kept for future monitoring/debugging use

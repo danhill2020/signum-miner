@@ -3,17 +3,14 @@ use self::core::{
 };
 use ocl_core as core;
 
+use crate::buffer::AlignedBuffer;
 use crate::config::Cfg;
 use crate::miner::Buffer;
+use crate::utils::lock_or_recover;
 use std::cmp::{max, min};
 use std::ffi::CString;
 use std::process;
-use std::slice::from_raw_parts_mut;
-use std::sync::Arc;
-#[cfg(not(feature = "async_io"))]
-use std::sync::Mutex;
-#[cfg(feature = "async_io")]
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 static SRC: &'static str = include_str!("ocl/kernel.cl");
 const SCOOP_SIZE: u64 = 64;
@@ -180,7 +177,7 @@ pub struct GpuContext {
 
 #[allow(dead_code)]
 pub struct GpuBuffer {
-    data: Arc<Mutex<Vec<u8>>>,
+    data: Arc<Mutex<AlignedBuffer>>,
     buffer_ptr_host: Option<core::MemMap<u8>>,
     buffer_host: Option<core::Mem>,
     context: Arc<GpuContext>,
@@ -303,13 +300,11 @@ impl GpuBuffer {
             };
 
             let ptr = buffer_ptr_host.as_mut().unwrap().as_mut_ptr();
-            let boxed_slice = unsafe {
-                Box::<[u8]>::from_raw(from_raw_parts_mut(
-                    ptr,
-                    (SCOOP_SIZE as usize) * context.gdim1[0],
-                ))
-            };
-            let data = Arc::new(Mutex::new(boxed_slice.into_vec()));
+            // The host memory belongs to OpenCL; wrap it without taking
+            // ownership so dropping the buffer never frees it.
+            let data = Arc::new(Mutex::new(unsafe {
+                AlignedBuffer::from_raw_parts_unowned(ptr, (SCOOP_SIZE as usize) * context.gdim1[0])
+            }));
 
             core::enqueue_unmap_mem_object(
                 &context.queue_transfer,
@@ -372,13 +367,11 @@ impl GpuBuffer {
             };
 
             let ptr = buffer_ptr_host.as_mut().unwrap().as_mut_ptr();
-            let boxed_slice = unsafe {
-                Box::<[u8]>::from_raw(from_raw_parts_mut(
-                    ptr,
-                    (SCOOP_SIZE as usize) * context.gdim1[0],
-                ))
-            };
-            let data = Arc::new(Mutex::new(boxed_slice.into_vec()));
+            // The host memory belongs to OpenCL; wrap it without taking
+            // ownership so dropping the buffer never frees it.
+            let data = Arc::new(Mutex::new(unsafe {
+                AlignedBuffer::from_raw_parts_unowned(ptr, (SCOOP_SIZE as usize) * context.gdim1[0])
+            }));
 
             GpuBuffer {
                 data,
@@ -393,7 +386,7 @@ impl GpuBuffer {
 }
 
 impl Buffer for GpuBuffer {
-    fn get_buffer_for_writing(&mut self) -> Arc<Mutex<Vec<u8>>> {
+    fn get_buffer_for_writing(&mut self) -> Arc<Mutex<AlignedBuffer>> {
         if self.context.mapping {
             unsafe {
                 self.buffer_ptr_host = Some(
@@ -411,9 +404,6 @@ impl Buffer for GpuBuffer {
                 );
             }
         }
-        self.data.clone()
-    }
-    fn get_buffer(&mut self) -> Arc<Mutex<Vec<u8>>> {
         self.data.clone()
     }
     fn get_gpu_buffers(&self) -> Option<&GpuBuffer> {
@@ -465,10 +455,7 @@ fn upload_gensig(gpu_context: &Arc<GpuContext>, gensig: [u8; 32], blocking: bool
 
 fn transfer_buffer_to_gpu(gpu_context: &Arc<GpuContext>, buffer: &GpuBuffer, blocking: bool) {
     let data = buffer.data.clone();
-    #[cfg(feature = "async_io")]
-    let data2 = (*data).blocking_lock();
-    #[cfg(not(feature = "async_io"))]
-    let data2 = (*data).lock().unwrap();
+    let data2 = lock_or_recover(&data);
     if gpu_context.mapping {
         let temp2 = buffer.buffer_ptr_host.as_ref().unwrap();
         core::enqueue_unmap_mem_object(

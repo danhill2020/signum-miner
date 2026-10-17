@@ -1,4 +1,4 @@
-use crate::plot::SCOOP_SIZE;
+use crate::plot::{DIRECT_IO_ALIGNMENT, SCOOP_SIZE};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -38,6 +38,8 @@ pub struct Cfg {
     #[serde(default = "default_cpu_worker_task_count")]
     pub cpu_worker_task_count: usize,
 
+    /// Kept for compatibility with older configs; `io_buffer_size` decides the
+    /// chunk size now.
     #[serde(default = "default_cpu_nonces_per_cache")]
     pub cpu_nonces_per_cache: usize,
 
@@ -119,6 +121,46 @@ pub struct Cfg {
     pub benchmark_only: Option<Benchmark>,
 }
 
+/// Every key the miner understands.  Anything else in the YAML is almost
+/// certainly a typo and gets a warning instead of being silently ignored.
+pub const KNOWN_KEYS: &[&str] = &[
+    "account_id_to_secret_phrase",
+    "plot_dirs",
+    "url",
+    "hdd_reader_thread_count",
+    "hdd_use_direct_io",
+    "hdd_wakeup_after",
+    "cpu_threads",
+    "cpu_worker_task_count",
+    "cpu_nonces_per_cache",
+    "io_buffer_size",
+    "cpu_thread_pinning",
+    "gpu_threads",
+    "gpu_platform",
+    "gpu_device",
+    "gpu_worker_task_count",
+    "gpu_nonces_per_cache",
+    "gpu_mem_mapping",
+    "gpu_async",
+    "target_deadline",
+    "account_id_to_target_deadline",
+    "get_mining_info_interval",
+    "timeout",
+    "send_proxy_details",
+    "additional_headers",
+    "capacity_check_interval",
+    "console_log_level",
+    "logfile_log_level",
+    "logfile_max_count",
+    "logfile_max_size",
+    "console_log_pattern",
+    "logfile_log_pattern",
+    "show_progress",
+    "show_drive_stats",
+    "submit_only_best",
+    "benchmark_only",
+];
+
 impl<'de> Deserialize<'de> for Benchmark {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -164,7 +206,7 @@ fn default_cpu_threads() -> usize {
 }
 
 fn default_cpu_worker_task_count() -> usize {
-    0
+    4
 }
 
 fn default_cpu_nonces_per_cache() -> usize {
@@ -252,11 +294,11 @@ fn default_logfile_max_size() -> u64 {
 }
 
 fn default_console_log_pattern() -> String {
-    "\r{d(%H:%M:%S.%3f%z)} [{h({l}):<5}] [{T}] [{t}] - {M}:{m}{n}".to_owned()
+    "{d(%H:%M:%S.%3f%z)} [{h({l}):<5}] [{T}] [{t}] - {M}:{m}{n}".to_owned()
 }
 
 fn default_logfile_log_pattern() -> String {
-    "\r{d(%Y-%m-%dT%H:%M:%S.%3f%z)} [{h({l}):<5}] [{T}] [{f}:{L}] [{t}] - {M}:{m}{n}".to_owned()
+    "{d(%Y-%m-%dT%H:%M:%S.%3f%z)} [{h({l}):<5}] [{T}] [{f}:{L}] [{t}] - {M}:{m}{n}".to_owned()
 }
 
 fn default_show_progress() -> bool {
@@ -271,32 +313,59 @@ fn default_submit_only_best() -> bool {
     true
 }
 
-pub fn load_cfg(config: &str) -> Result<Cfg, String> {
-    let cfg_str = fs::read_to_string(config)
-        .map_err(|e| format!("Failed to open config file '{}': {}. Please check that the file exists and is readable.", config, e))?;
+/// Top-level keys present in the YAML that the miner does not know about.
+pub fn unknown_keys(cfg_str: &str) -> Vec<String> {
+    let value: serde_yaml::Value = match serde_yaml::from_str(cfg_str) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(map) = value.as_mapping() else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(k, _)| k.as_str().map(str::to_owned))
+        .filter(|k| !KNOWN_KEYS.contains(&k.as_str()))
+        .collect()
+}
 
-    let cfg: Cfg = serde_yaml::from_str(&cfg_str).map_err(|e| {
+pub fn load_cfg(config: &str) -> Result<Cfg, String> {
+    let cfg_str = fs::read_to_string(config).map_err(|e| {
         format!(
-            "Failed to parse config file '{}': {}. Please check YAML syntax.",
+            "Failed to open config file '{}': {}. Please check that the file exists and is readable.",
             config, e
         )
     })?;
-
-    if cfg.hdd_use_direct_io {
-        let cpu_nonces_per_cache = cfg.io_buffer_size / SCOOP_SIZE as usize;
-        #[allow(clippy::manual_is_multiple_of)]
-        if cpu_nonces_per_cache % 64 != 0 || cfg.gpu_nonces_per_cache % 64 != 0 {
-            return Err(format!(
-                "Configuration error: nonces_per_cache should be divisible by 64 when using direct I/O. \
-                Current values: io_buffer_size={} (results in {} nonces), gpu_nonces_per_cache={}",
-                cfg.io_buffer_size, cpu_nonces_per_cache, cfg.gpu_nonces_per_cache
-            ));
-        }
-    }
-    Ok(validate_cfg(cfg))
+    parse_cfg(&cfg_str, config)
 }
 
-pub fn validate_cfg(mut cfg: Cfg) -> Cfg {
+pub fn parse_cfg(cfg_str: &str, origin: &str) -> Result<Cfg, String> {
+    let cfg: Cfg = serde_yaml::from_str(cfg_str).map_err(|e| {
+        format!(
+            "Failed to parse config file '{}': {}. Please check YAML syntax.",
+            origin, e
+        )
+    })?;
+
+    for key in unknown_keys(cfg_str) {
+        warn!(
+            "config '{}': unknown setting '{}' is ignored (typo?)",
+            origin, key
+        );
+    }
+
+    validate_cfg(cfg)
+}
+
+/// Check the loaded values for mistakes a user would otherwise only discover
+/// from odd behaviour hours later, and fill in the `0 = auto` values.
+pub fn validate_cfg(mut cfg: Cfg) -> Result<Cfg, String> {
+    if cfg.url.host_str().is_none() {
+        return Err(format!(
+            "Configuration error: url '{}' has no host. Expected something like 'https://pool.example.com:8080'",
+            cfg.url
+        ));
+    }
+
     let cores = num_cpus::get();
     if cfg.cpu_threads == 0 {
         cfg.cpu_threads = cores;
@@ -308,26 +377,76 @@ pub fn validate_cfg(mut cfg: Cfg) -> Cfg {
         cfg.cpu_threads = cores;
     };
 
-    #[allow(clippy::iter_overeager_cloned)]
+    if cfg.io_buffer_size == 0 || cfg.io_buffer_size % SCOOP_SIZE as usize != 0 {
+        return Err(format!(
+            "Configuration error: io_buffer_size ({}) must be a positive multiple of {} bytes",
+            cfg.io_buffer_size, SCOOP_SIZE
+        ));
+    }
+    if cfg.hdd_use_direct_io && cfg.io_buffer_size % DIRECT_IO_ALIGNMENT as usize != 0 {
+        return Err(format!(
+            "Configuration error: io_buffer_size ({}) must be a multiple of {} bytes when hdd_use_direct_io is enabled",
+            cfg.io_buffer_size, DIRECT_IO_ALIGNMENT
+        ));
+    }
+    if cfg.hdd_use_direct_io && cfg.gpu_nonces_per_cache % 64 != 0 {
+        return Err(format!(
+            "Configuration error: gpu_nonces_per_cache ({}) must be divisible by 64 when hdd_use_direct_io is enabled",
+            cfg.gpu_nonces_per_cache
+        ));
+    }
+    if cfg.cpu_worker_task_count == 0 && cfg.gpu_worker_task_count == 0 {
+        return Err(
+            "Configuration error: cpu_worker_task_count and gpu_worker_task_count are both 0, nothing would hash the plots"
+                .to_string(),
+        );
+    }
+    if cfg.get_mining_info_interval < 1000 {
+        warn!(
+            "get_mining_info_interval {}ms is below the 1000ms floor, using 1000ms",
+            cfg.get_mining_info_interval
+        );
+        cfg.get_mining_info_interval = 1000;
+    }
+    if cfg.timeout < 100 {
+        warn!("timeout {}ms is unreasonably low, using 100ms", cfg.timeout);
+        cfg.timeout = 100;
+    }
+    if cfg.logfile_max_count == 0 {
+        cfg.logfile_max_count = 1;
+    }
+    if cfg.logfile_max_size == 0 {
+        cfg.logfile_max_size = 1;
+    }
+    if cfg.hdd_wakeup_after < 0 {
+        warn!("hdd_wakeup_after is negative, disabling wakeup");
+        cfg.hdd_wakeup_after = 0;
+    }
+
     let filtered_dirs: Vec<PathBuf> = cfg
         .plot_dirs
         .iter()
-        .cloned()
         .filter(|plot_dir| {
             if !plot_dir.exists() {
-                warn!("path {} does not exist", plot_dir.to_str().unwrap());
+                warn!("path {} does not exist", plot_dir.display());
                 false
             } else if !plot_dir.is_dir() {
-                warn!("path {} is not a directory", plot_dir.to_str().unwrap());
+                warn!("path {} is not a directory", plot_dir.display());
                 false
             } else {
                 true
             }
         })
+        .cloned()
         .collect();
+    if cfg.plot_dirs.is_empty() {
+        warn!("no plot_dirs configured");
+    } else if filtered_dirs.is_empty() {
+        warn!("none of the configured plot_dirs exist right now; the miner will keep rescanning");
+    }
     cfg.plot_dirs = filtered_dirs;
 
-    cfg
+    Ok(cfg)
 }
 
 impl Cfg {
@@ -344,56 +463,100 @@ impl Cfg {
 mod tests {
     use super::*;
 
+    fn minimal(extra: &str) -> String {
+        format!("plot_dirs: []\nurl: 'http://localhost:8125'\n{}", extra)
+    }
+
     #[test]
     fn test_load_cfg() {
-        use std::path::PathBuf;
-
-        // Pfad zu test_data/config.yaml relativ zum Projekt-Root
         let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("test_data")
             .join("test_config.yaml");
-        println!("Loading config from: {}", config_path.display());
-        let contents = std::fs::read_to_string(&config_path).unwrap();
-        println!("YAML content:\n{}", contents);
-        println!("Path to config: {:?}", config_path);
-        // Konfiguration laden
         let cfg = load_cfg(config_path.to_str().unwrap()).expect("Failed to load config in test");
 
-        // Ausgabe für Debugging
-        println!("cfg.plot_dirs = {:?}", cfg.plot_dirs);
-        println!("cfg.timeout = {:?}", cfg.timeout);
-
-        // Erwartete Werte prüfen
         assert_eq!(cfg.timeout, 5000);
-
         let expected_path = PathBuf::from("test_data");
         assert_eq!(cfg.plot_dirs, vec![expected_path]);
     }
 
     #[test]
     fn test_load_cfg_trims_url_whitespace() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let file_name = format!(
-            "signum-miner-test-{}.yaml",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("Failed to read clock")
-                .as_nanos()
-        );
-        let path = std::env::temp_dir().join(file_name);
-
-        let yaml = "\
-plot_dirs: []
-url: \"  https://pool.signumcoin.ro  \"
-";
-        std::fs::write(&path, yaml).expect("Failed to write temporary config");
-
-        let cfg = load_cfg(path.to_str().expect("Invalid temp path"))
-            .expect("Failed to load config with whitespace URL");
-
+        let cfg = parse_cfg(
+            "plot_dirs: []\nurl: \"  https://pool.signumcoin.ro  \"\n",
+            "inline",
+        )
+        .expect("Failed to load config with whitespace URL");
         assert_eq!(cfg.url.as_str(), "https://pool.signumcoin.ro/");
+    }
 
-        std::fs::remove_file(path).expect("Failed to remove temporary config");
+    #[test]
+    fn minimal_config_gets_working_defaults() {
+        let cfg = parse_cfg(&minimal(""), "inline").unwrap();
+        assert!(cfg.cpu_threads >= 1);
+        assert_eq!(cfg.cpu_worker_task_count, 4);
+        assert_eq!(cfg.io_buffer_size, 16 * 1024 * 1024);
+        assert!(cfg.hdd_use_direct_io);
+        assert!(cfg.submit_only_best);
+    }
+
+    #[test]
+    fn rejects_zero_workers() {
+        let err = parse_cfg(&minimal("cpu_worker_task_count: 0\n"), "inline").unwrap_err();
+        assert!(err.contains("cpu_worker_task_count"), "{}", err);
+    }
+
+    #[test]
+    fn rejects_unaligned_buffer_with_direct_io() {
+        let err = parse_cfg(&minimal("io_buffer_size: 100000\n"), "inline").unwrap_err();
+        assert!(err.contains("io_buffer_size"), "{}", err);
+        // Multiples of 64 are fine once direct I/O is off.
+        let cfg = parse_cfg(
+            &minimal("io_buffer_size: 6400\nhdd_use_direct_io: false\n"),
+            "inline",
+        )
+        .unwrap();
+        assert_eq!(cfg.io_buffer_size, 6400);
+        let err = parse_cfg(
+            &minimal("io_buffer_size: 100\nhdd_use_direct_io: false\n"),
+            "inline",
+        )
+        .unwrap_err();
+        assert!(err.contains("multiple of 64"), "{}", err);
+    }
+
+    #[test]
+    fn rejects_url_without_host() {
+        let err = parse_cfg("plot_dirs: []\nurl: 'mailto:someone'\n", "inline").unwrap_err();
+        assert!(err.contains("no host"), "{}", err);
+    }
+
+    #[test]
+    fn floors_polling_interval_and_timeout() {
+        let cfg = parse_cfg(
+            &minimal("get_mining_info_interval: 10\ntimeout: 1\n"),
+            "inline",
+        )
+        .unwrap();
+        assert_eq!(cfg.get_mining_info_interval, 1000);
+        assert_eq!(cfg.timeout, 100);
+    }
+
+    #[test]
+    fn unknown_keys_are_reported() {
+        let keys = unknown_keys(&minimal("hdd_use_direct_i0: true\ncpu_treads: 2\n"));
+        assert_eq!(
+            keys,
+            vec!["hdd_use_direct_i0".to_string(), "cpu_treads".to_string()]
+        );
+        assert!(unknown_keys(&minimal("cpu_threads: 2\n")).is_empty());
+    }
+
+    #[test]
+    fn sample_config_only_uses_known_keys() {
+        let sample =
+            std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.yaml"))
+                .unwrap();
+        assert!(unknown_keys(&sample).is_empty());
+        parse_cfg(&sample, "config.yaml").expect("sample config must load");
     }
 }

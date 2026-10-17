@@ -2,31 +2,20 @@ use bytes::Bytes;
 use serde::de::{self, DeserializeOwned};
 use std::fmt;
 
-#[allow(dead_code)]
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SubmitNonceRequest<'a> {
-    pub request_type: &'a str,
-    pub account_id: u64,
-    pub nonce: u64,
-    pub secret_phrase: Option<&'a String>,
-    pub blockheight: u64,
-    pub deadline: Option<u64>,
-}
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetMiningInfoRequest<'a> {
     pub request_type: &'a str,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct SubmitNonceResponse {
+    #[serde(deserialize_with = "from_str_or_int")]
     pub deadline: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MiningInfoResponse {
     pub generation_signature: String,
@@ -57,7 +46,9 @@ struct PoolErrorWrapper {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolError {
+    #[serde(default)]
     pub code: i32,
+    #[serde(default)]
     pub message: String,
 }
 
@@ -65,6 +56,18 @@ pub struct PoolError {
 pub enum FetchError {
     Http(reqwest::Error),
     Pool(PoolError),
+}
+
+impl fmt::Display for FetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FetchError::Http(e) => write!(f, "http error: {}", e),
+            FetchError::Pool(e) => {
+                let msg: String = e.message.chars().take(200).collect();
+                write!(f, "pool error {}: {}", e.code, msg.trim())
+            }
+        }
+    }
 }
 
 impl From<reqwest::Error> for FetchError {
@@ -99,6 +102,10 @@ where
         fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
             Ok(v)
         }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            u64::try_from(v).map_err(de::Error::custom)
+        }
     }
 
     deserializer.deserialize_any(StringOrIntVisitor)
@@ -117,5 +124,45 @@ pub fn parse_json_result<T: DeserializeOwned>(body: &Bytes) -> Result<T, PoolErr
                 })
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mining_info_accepts_strings_and_ints() {
+        let body = Bytes::from_static(
+            br#"{"generationSignature":"ab","baseTarget":"123","height":456,"targetDeadline":"789"}"#,
+        );
+        let info: MiningInfoResponse = parse_json_result(&body).unwrap();
+        assert_eq!(info.base_target, 123);
+        assert_eq!(info.height, 456);
+        assert_eq!(info.target_deadline, 789);
+
+        let body = Bytes::from_static(br#"{"generationSignature":"ab","baseTarget":1,"height":2}"#);
+        let info: MiningInfoResponse = parse_json_result(&body).unwrap();
+        assert_eq!(info.target_deadline, u64::MAX);
+    }
+
+    #[test]
+    fn pool_errors_are_decoded() {
+        let body = Bytes::from_static(br#"{"error":{"code":1008,"message":"limit exceeded"}}"#);
+        let err = parse_json_result::<SubmitNonceResponse>(&body).unwrap_err();
+        assert_eq!(err.code, 1008);
+        assert_eq!(err.message, "limit exceeded");
+
+        let body = Bytes::from_static(b"<html>502 Bad Gateway</html>");
+        let err = parse_json_result::<SubmitNonceResponse>(&body).unwrap_err();
+        assert_eq!(err.code, 0);
+        assert!(err.message.contains("502"));
+    }
+
+    #[test]
+    fn submit_response_accepts_string_deadline() {
+        let body = Bytes::from_static(br#"{"result":"success","deadline":"42"}"#);
+        let res: SubmitNonceResponse = parse_json_result(&body).unwrap();
+        assert_eq!(res.deadline, 42);
     }
 }

@@ -1,0 +1,51 @@
+# systemd unit for signum-miner.
+#
+# Install:
+#   sudo mkdir -p /opt/signum-miner
+#   sudo cp target/release/signum-miner config.yaml /opt/signum-miner/
+#   sudo useradd --system --home /opt/signum-miner --shell /usr/sbin/nologin signum  # once
+#   sudo chown -R signum:signum /opt/signum-miner
+#   sudo cp contrib/signum-miner.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now signum-miner
+#   journalctl -u signum-miner -f
+#
+# The plot directories must be readable by the `signum` user.  For USB bays
+# that are mounted via /etc/fstab, list the mount points in RequiresMountsFor
+# so the miner only starts once they are mounted.
+
+[Unit]
+Description=Signum PoC+ miner
+Documentation=https://github.com/signum-network/signum-miner
+After=network-online.target
+Wants=network-online.target
+# RequiresMountsFor=/mnt/bay1 /mnt/bay2 /mnt/bay3 /mnt/bay4
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=signum
+Group=signum
+WorkingDirectory=/opt/signum-miner
+ExecStart=/opt/signum-miner/signum-miner --config /opt/signum-miner/config.yaml
+Restart=always
+RestartSec=15
+# Log to the journal; file logging can stay off (logfile_log_level: off).
+StandardOutput=journal
+StandardError=journal
+# Reader threads and big sequential reads benefit from a high I/O priority
+# relative to anything else on the box.
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+Nice=-5
+LimitNOFILE=65536
+# Hardening: the miner only needs to read plots and talk to the pool.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/signum-miner
+# ReadOnlyPaths=/mnt/bay1 /mnt/bay2 /mnt/bay3 /mnt/bay4
+
+[Install]
+WantedBy=multi-user.target

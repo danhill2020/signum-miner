@@ -9,14 +9,17 @@ url: 'https://pool.burstcoin.ro'      # mainnet pool
 #url: 'http://localhost:8125'         # solo mining
 #url: 'http://localhost:6876'         # solo mining testnet
 
-hdd_reader_thread_count: 0            # default 0 (=auto: number of disks)
-hdd_use_direct_io: true               # default true (ignored on USB drives)
-hdd_wakeup_after: 240                 # default 240s
+hdd_reader_thread_count: 0            # default 0 (=auto: one thread per physical disk)
+hdd_use_direct_io: true               # default true; falls back to buffered reads per plot
+                                      # when the filesystem refuses O_DIRECT (e.g. ntfs-3g)
+hdd_wakeup_after: 240                 # default 240s; 0 disables. Reads one block from every
+                                      # drive when no block arrived for this long, so
+                                      # external USB bays do not spin down
 
-cpu_threads: 4                        # default 4 (0=auto: number of logical cpu cores)
+cpu_threads: 0                        # default 0 (=auto: number of logical cpu cores)
 cpu_worker_task_count: 4              # default 4 (0=GPU only)
-cpu_nonces_per_cache: 65536           # default 65536
-io_buffer_size: 16777216              # default 16MiB
+io_buffer_size: 16777216              # default 16MiB; bytes read per request, must be a
+                                      # multiple of 4096. 8-32 MiB is good for USB drives
 cpu_thread_pinning: false             # default false
 
 gpu_threads: 0                        # default 0 (=GPU off)
@@ -33,7 +36,8 @@ target_deadline: 31536000             # default 31536000 (1 year)
 # 1796535821016683299: 55555555
 
 get_mining_info_interval: 3000        # default 3000ms
-capacity_check_interval: 21600        # default 21600s
+capacity_check_interval: 21600        # default 21600s; rescans every 60s instead while a
+                                      # plot dir is missing/empty or had read errors
 timeout: 5000                         # default 5000ms
 send_proxy_details: false              # default false
 submit_only_best: true                # default true
@@ -45,8 +49,9 @@ logfile_log_level: 'warn'             # default Warn, options (off, error, warn,
 logfile_max_count: 10                 # maximum number of log files to keep
 logfile_max_size : 20                 # maximum size per logfile in MiB
 
-show_progress: true                   # default true  
-show_drive_stats: false               # default false 
+show_progress: true                   # default true (automatically off when stdout is
+                                      # not a terminal, e.g. under systemd)
+show_drive_stats: false               # default false
 benchmark_only: 'disabled'            # default disabled, options (disabled, I/O, XPU)
 
 # Low noise log patterns

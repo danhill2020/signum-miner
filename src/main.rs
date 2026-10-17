@@ -1,4 +1,3 @@
-//! Modernized main.rs with async/await support
 #![warn(unused_extern_crates)]
 
 #[macro_use]
@@ -8,6 +7,7 @@ extern crate cfg_if;
 #[macro_use]
 extern crate log;
 
+mod buffer;
 mod com;
 mod config;
 mod cpu_worker;
@@ -20,6 +20,8 @@ mod poc_hashing;
 mod reader;
 mod requests;
 mod shabal256;
+#[cfg(test)]
+mod test_support;
 mod utils;
 
 #[cfg(feature = "opencl")]
@@ -32,82 +34,64 @@ mod ocl;
 use crate::config::load_cfg;
 use crate::miner::Miner;
 use clap::{Arg, Command};
-#[cfg(feature = "opencl")]
 use std::process;
 
-cfg_if! {
-    if #[cfg(feature = "simd_avx512f")] {
-        extern "C" {
-            pub fn init_shabal_avx512f();
-        }
-
-        fn init_cpu_extensions() {
-            info!("SIMD extensions: AVX512F");
-            unsafe { init_shabal_avx512f(); }
-        }
-    } else if #[cfg(feature = "simd_avx2")] {
-        extern "C" {
-            pub fn init_shabal_avx2();
-        }
-
-        fn init_cpu_extensions() {
-            info!("SIMD extensions: AVX2");
-            unsafe { init_shabal_avx2(); }
-        }
-    } else if #[cfg(feature = "simd_avx")] {
-        extern "C" {
-            pub fn init_shabal_avx();
-        }
-
-        fn init_cpu_extensions() {
-            info!("SIMD extensions: AVX");
-            unsafe { init_shabal_avx(); }
-        }
-    } else if #[cfg(feature = "simd_sse2")] {
-        extern "C" {
-            pub fn init_shabal_sse2();
-        }
-
-        fn init_cpu_extensions() {
-            info!("SIMD extensions: SSE2");
-            unsafe { init_shabal_sse2(); }
-        }
-    }  else if #[cfg(feature = "neon")] {
-         extern "C" {
-            pub fn init_shabal_neon();
-        }
-        fn init_cpu_extensions() {
-            info!("SIMD extensions: neon");
-            unsafe { init_shabal_neon();}
-        }
-    } else {
-        fn init_cpu_extensions() {
-            info!("SIMD extensions: none");
+/// Refuse to run a binary whose SIMD backend this CPU cannot execute.  The
+/// alternative is an "Illegal instruction" crash in the middle of the first
+/// round, which is much harder to diagnose.
+fn check_cpu_support() -> Result<(), String> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        let required: Option<(&str, bool)> = {
+            cfg_if! {
+                if #[cfg(simd_backend = "avx512f")] {
+                    Some(("avx512f", std::is_x86_feature_detected!("avx512f")))
+                } else if #[cfg(simd_backend = "avx2")] {
+                    Some(("avx2", std::is_x86_feature_detected!("avx2")))
+                } else if #[cfg(simd_backend = "avx")] {
+                    Some(("avx", std::is_x86_feature_detected!("avx")))
+                } else if #[cfg(simd_backend = "sse2")] {
+                    Some(("sse2", std::is_x86_feature_detected!("sse2")))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some((name, supported)) = required {
+            if !supported {
+                return Err(format!(
+                    "this build uses {} instructions which this CPU does not support; \
+                     download or build a variant for your CPU (supported here: {})",
+                    name.to_uppercase(),
+                    supported_x86_features().join(", ")
+                ));
+            }
         }
     }
+    Ok(())
 }
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-fn print_simd_support() {
-    println!("SIMD support check:");
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn supported_x86_features() -> Vec<&'static str> {
+    let mut v = Vec::new();
     if std::is_x86_feature_detected!("avx512f") {
-        println!("✅ AVX-512F supported");
+        v.push("avx512f");
     }
     if std::is_x86_feature_detected!("avx2") {
-        println!("✅ AVX2 supported");
+        v.push("avx2");
     }
     if std::is_x86_feature_detected!("avx") {
-        println!("✅ AVX supported");
-    }
-    if std::is_x86_feature_detected!("sse4.2") {
-        println!("✅ SSE4.2 supported");
-    }
-    if std::is_x86_feature_detected!("sse4.1") {
-        println!("✅ SSE4.1 supported");
+        v.push("avx");
     }
     if std::is_x86_feature_detected!("sse2") {
-        println!("✅ SSE2 supported");
+        v.push("sse2");
     }
+    v
+}
+
+fn fail(msg: &str) -> ! {
+    eprintln!("error: {}", msg);
+    process::exit(1);
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -124,6 +108,12 @@ async fn main() {
                 .help("Location of the config file")
                 .default_value("config.yaml")
                 .required(false),
+        )
+        .arg(
+            Arg::new("check")
+                .long("check")
+                .help("Validate the configuration and plot directories, then exit")
+                .action(clap::ArgAction::SetTrue),
         );
 
     #[cfg(feature = "opencl")]
@@ -141,43 +131,60 @@ async fn main() {
         .map(|s| s.as_str())
         .unwrap_or("config.yaml");
 
+    if let Err(e) = check_cpu_support() {
+        fail(&e);
+    }
+
     let cfg_loaded = match load_cfg(config) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("❌ Configuration Error: {}", e);
-            eprintln!("\nPlease create a valid config.yaml file or specify a different config file with --config");
-            std::process::exit(1);
+            eprintln!("Configuration error: {}", e);
+            eprintln!(
+                "\nPlease create a valid config.yaml file or specify a different config file with --config"
+            );
+            process::exit(1);
         }
     };
-    logger::init_logger(&cfg_loaded);
+    if let Err(e) = logger::init_logger(&cfg_loaded) {
+        fail(&e);
+    }
 
     info!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-
+    info!(
+        "hashing backend: {}, {} logical CPU(s)",
+        cpu_worker::backend_name(),
+        num_cpus::get()
+    );
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    print_simd_support();
+    info!("CPU SIMD support: {}", supported_x86_features().join(", "));
 
     #[cfg(feature = "opencl")]
     info!("GPU extensions: OpenCL");
 
     #[cfg(feature = "opencl")]
-    if matches.contains_id("opencl") {
+    if matches.get_flag("opencl") {
         ocl::platform_info();
         process::exit(0);
     }
 
-    #[cfg(any(
-        feature = "simd_avx512f",
-        feature = "simd_avx2",
-        feature = "simd_avx",
-        feature = "simd_sse2",
-        feature = "neon"
-    ))]
-    init_cpu_extensions();
+    cpu_worker::init_backend();
 
     #[cfg(feature = "opencl")]
     ocl::gpu_info(&cfg_loaded);
 
     let handle = tokio::runtime::Handle::current();
-    let miner = Miner::new(cfg_loaded, handle);
+    let miner = match Miner::new(cfg_loaded, handle) {
+        Ok(miner) => miner,
+        Err(e) => {
+            error!("{}", e);
+            process::exit(1);
+        }
+    };
+
+    if matches.get_flag("check") {
+        info!("configuration check passed");
+        process::exit(0);
+    }
+
     miner.run().await;
 }

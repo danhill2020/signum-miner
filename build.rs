@@ -1,18 +1,25 @@
-// Import the `cc` crate for compiling C files
-extern crate cc;
+//! Build script: compiles the C Shabal implementations and picks the SIMD
+//! backend that matches the *target* architecture.
+//!
+//! Cargo features cannot depend on the target, so `--features simd_avx2`
+//! (the default) would otherwise try to compile AVX2 code on a Raspberry Pi.
+//! Instead the script resolves the requested features against the target and
+//! tells the Rust side which backend exists via `cfg(simd_backend = "...")`.
+
 use std::env;
 use std::process::Command;
 
+const BACKENDS: &[&str] = &["none", "sse2", "avx", "avx2", "avx512f", "neon"];
+
 #[cfg(target_env = "gnu")]
 fn compile_windows_icon() {
-    let target = std::env::var("TARGET").unwrap_or_default();
+    let target = env::var("TARGET").unwrap_or_default();
     if target.contains("windows") {
-        let out_dir = std::env::var("OUT_DIR").unwrap();
+        let out_dir = env::var("OUT_DIR").unwrap();
 
         let rc_path = "src/windows/app.rc";
         let res_path = format!("{}/icon.res", out_dir);
 
-        // Compile .rc file into .res
         let windres_cmd = if Command::new("x86_64-w64-mingw32-windres")
             .arg("--version")
             .status()
@@ -31,7 +38,7 @@ fn compile_windows_icon() {
             println!("cargo:warning=Windres not found, skipping icon resource compilation.");
             return;
         };
-        let status = std::process::Command::new(windres_cmd)
+        let status = Command::new(windres_cmd)
             .args([
                 "--input",
                 rc_path,
@@ -46,36 +53,116 @@ fn compile_windows_icon() {
             panic!("windres failed with status {}", status);
         }
 
-        // Link .res file
         println!("cargo:rustc-link-arg-bin=signum-miner={}", res_path);
     }
 }
 
+fn feature(name: &str) -> bool {
+    env::var(format!("CARGO_FEATURE_{}", name.to_uppercase())).is_ok()
+}
+
+/// Decide which backend to build for `target_arch` given the enabled features.
+fn select_backend(target_arch: &str, requested_x86: &[&str], neon_requested: bool) -> String {
+    match target_arch {
+        "x86" | "x86_64" => {
+            if neon_requested && requested_x86.is_empty() {
+                println!(
+                    "cargo:warning=feature 'neon' has no effect on {}; building without SIMD",
+                    target_arch
+                );
+            }
+            match requested_x86 {
+                [] => "none".to_string(),
+                [one] => one.to_string(),
+                many => panic!(
+                    "Multiple SIMD features enabled ({:?}). Please activate only one of 'simd_sse2', 'simd_avx', 'simd_avx2', or 'simd_avx512f'.",
+                    many
+                ),
+            }
+        }
+        "aarch64" => {
+            // NEON is mandatory on AArch64, so it is always safe to use.  The
+            // default feature set requests AVX2; honour the intent (fast
+            // hashing) rather than the letter.
+            if !neon_requested && !requested_x86.is_empty() {
+                println!(
+                    "cargo:warning=x86 SIMD feature(s) {:?} requested for aarch64; using NEON instead",
+                    requested_x86
+                );
+            }
+            "neon".to_string()
+        }
+        "arm" => {
+            // 32-bit ARM: NEON is optional, only use it when asked for.
+            if neon_requested {
+                "neon".to_string()
+            } else {
+                if !requested_x86.is_empty() {
+                    println!(
+                        "cargo:warning=x86 SIMD feature(s) {:?} requested for arm; building without SIMD (use --features neon on NEON capable boards)",
+                        requested_x86
+                    );
+                }
+                "none".to_string()
+            }
+        }
+        other => {
+            if neon_requested || !requested_x86.is_empty() {
+                println!(
+                    "cargo:warning=no SIMD backend available for target arch '{}'; building without SIMD",
+                    other
+                );
+            }
+            "none".to_string()
+        }
+    }
+}
+
 fn main() {
-    let mut shared_config = cc::Build::new();
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/c");
+    println!("cargo:rerun-if-changed=src/windows/app.rc");
+    println!(
+        "cargo:rustc-check-cfg=cfg(simd_backend, values({}))",
+        BACKENDS
+            .iter()
+            .map(|b| format!("\"{}\"", b))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    if feature("async_io") {
+        println!(
+            "cargo:warning=feature 'async_io' is deprecated and has no effect; plot reads always use positional blocking I/O on dedicated reader threads"
+        );
+    }
 
     #[cfg(target_env = "gnu")]
     compile_windows_icon();
 
-    // Apply optimization flags depending on compiler environment
-    if cfg!(target_env = "msvc") {
-        // Visual Studio (MSVC) specific optimization flags
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let msvc = target_env == "msvc";
+
+    let mut shared_config = cc::Build::new();
+    // The hashing loop is the hot path of the whole miner: always optimise it
+    // for speed, whatever the Rust profile says.
+    shared_config.opt_level(3);
+    if msvc {
         shared_config
-            .flag("/O2")
             .flag("/Oi")
             .flag("/Ot")
             .flag("/Oy")
             .flag("/GT")
             .flag("/GL");
     } else {
-        // Non-MSVC: use C99 standard and tune for native CPU when not cross-compiling
         shared_config.flag("-std=c99");
         if env::var("HOST").ok() == env::var("TARGET").ok() {
             shared_config.flag("-mtune=native");
         }
     }
 
-    // **Always compile the baseline (non-SIMD) Shabal implementation**
+    // Always compile the baseline (non-SIMD) Shabal implementation.
     let mut base_config = shared_config.clone();
     base_config
         .file("src/c/sph_shabal.c")
@@ -83,47 +170,33 @@ fn main() {
         .file("src/c/common.c")
         .compile("shabal");
 
-    // **Detect which SIMD features are enabled**
-    let simd_sse2 = env::var("CARGO_FEATURE_SIMD_SSE2").is_ok();
-    let simd_avx = env::var("CARGO_FEATURE_SIMD_AVX").is_ok();
-    let simd_avx2 = env::var("CARGO_FEATURE_SIMD_AVX2").is_ok();
-    let simd_avx512f = env::var("CARGO_FEATURE_SIMD_AVX512F").is_ok();
-
-    // **Ensure that at most one SIMD variant is active** – if more than one is enabled, stop with an error.
-    let simd_count = [simd_sse2, simd_avx, simd_avx2, simd_avx512f]
-        .iter()
-        .filter(|&&enabled| enabled)
-        .count();
-    if simd_count > 1 {
-        panic!(
-            "Multiple SIMD features enabled ({:?}). Please activate only one of 'simd_sse2', 'simd_avx', 'simd_avx2', or 'simd_avx512f'.",
-            [
-                (simd_sse2, "simd_sse2"),
-                (simd_avx, "simd_avx"),
-                (simd_avx2, "simd_avx2"),
-                (simd_avx512f, "simd_avx512f")
-            ]
-            .iter()
-            .filter_map(|&(enabled, name)| if enabled { Some(name) } else { None })
-            .collect::<Vec<&str>>()
-        );
+    let mut requested_x86 = Vec::new();
+    for (name, flag) in [
+        ("simd_sse2", "sse2"),
+        ("simd_avx", "avx"),
+        ("simd_avx2", "avx2"),
+        ("simd_avx512f", "avx512f"),
+    ] {
+        if feature(name) {
+            requested_x86.push(flag);
+        }
     }
+    let backend = select_backend(&target_arch, &requested_x86, feature("neon"));
+    println!("cargo:rustc-cfg=simd_backend=\"{}\"", backend);
 
-    // **Compile the selected SIMD variant (if exactly one is enabled)**
-    if simd_count == 1 {
-        let mut config = base_config.clone();
-        if simd_sse2 {
-            // Enable SSE2 intrinsics
-            if !cfg!(target_env = "msvc") {
+    let mut config = base_config.clone();
+    match backend.as_str() {
+        "sse2" => {
+            if !msvc {
                 config.flag("-msse2");
             }
             config
                 .file("src/c/mshabal_128_sse2.c")
                 .file("src/c/shabal_sse2.c")
                 .compile("shabal_sse2");
-        } else if simd_avx {
-            // Enable AVX intrinsics
-            if cfg!(target_env = "msvc") {
+        }
+        "avx" => {
+            if msvc {
                 config.flag("/arch:AVX");
             } else {
                 config.flag("-mavx");
@@ -132,9 +205,9 @@ fn main() {
                 .file("src/c/mshabal_128_avx.c")
                 .file("src/c/shabal_avx.c")
                 .compile("shabal_avx");
-        } else if simd_avx2 {
-            // Enable AVX2 intrinsics
-            if cfg!(target_env = "msvc") {
+        }
+        "avx2" => {
+            if msvc {
                 config.flag("/arch:AVX2");
             } else {
                 config.flag("-mavx2");
@@ -143,9 +216,9 @@ fn main() {
                 .file("src/c/mshabal_256_avx2.c")
                 .file("src/c/shabal_avx2.c")
                 .compile("shabal_avx2");
-        } else if simd_avx512f {
-            // Enable AVX-512F intrinsics
-            if cfg!(target_env = "msvc") {
+        }
+        "avx512f" => {
+            if msvc {
                 config.flag("/arch:AVX512");
             } else {
                 config.flag("-mavx512f");
@@ -155,29 +228,15 @@ fn main() {
                 .file("src/c/shabal_avx512f.c")
                 .compile("shabal_avx512f");
         }
-    }
-    // If the umbrella "simd" feature is enabled *without* any specific subfeature,
-    // no SIMD variant will be compiled (simd_count == 0, so nothing to do here).
-
-    // **Compile Neon variant (independently selectable)**
-    if env::var("CARGO_FEATURE_NEON").is_ok() {
-        // Only attempt Neon build for ARM targets:
-        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-        if target_arch == "arm" || target_arch == "aarch64" {
-            let mut config = base_config.clone();
-            // On 32-bit ARM (not AArch64 and not MSVC), use Neon FPU flag
-            if target_arch == "arm" && !cfg!(target_env = "msvc") {
+        "neon" => {
+            if target_arch == "arm" && !msvc {
                 config.flag("-mfpu=neon");
             }
             config
                 .file("src/c/mshabal_128_neon.c")
                 .file("src/c/shabal_neon.c")
                 .compile("shabal_neon");
-        } else {
-            println!(
-                "cargo:warning=Feature 'neon' was enabled for target arch '{}', but Neon is only supported on ARM. Skipping Neon build.",
-                target_arch
-            );
         }
+        _ => {}
     }
 }

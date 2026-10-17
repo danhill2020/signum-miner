@@ -4,14 +4,13 @@ use crate::ocl::{gpu_hash, gpu_transfer};
 use crate::reader::ReadReply;
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::Arc;
-use std::u64;
 use tokio::sync::mpsc;
 
 pub fn create_gpu_worker_task(
     benchmark: bool,
     rx_read_replies: Receiver<ReadReply>,
     tx_empty_buffers: Sender<Box<dyn Buffer + Send>>,
-    tx_nonce_data: mpsc::UnboundedSender<NonceData>,
+    tx_nonce_data: mpsc::Sender<NonceData>,
     context_mu: Arc<GpuContext>,
 ) -> impl FnOnce() + Send + 'static {
     move || {
@@ -19,19 +18,17 @@ pub fn create_gpu_worker_task(
             let buffer = read_reply.buffer;
             // handle empty buffers (read errors) && benchmark
             if read_reply.info.len == 0 || benchmark {
-                // forward 'drive finished signal'
-                if read_reply.info.finished {
-                    let deadline = u64::MAX;
-                    let _ = tx_nonce_data.send(NonceData {
-                        height: read_reply.info.height,
-                        block: read_reply.info.block,
-                        base_target: read_reply.info.base_target,
-                        deadline,
-                        nonce: 0,
-                        reader_task_processed: read_reply.info.finished,
-                        account_id: read_reply.info.account_id,
-                    });
-                }
+                // every chunk produces exactly one result
+                let _ = tx_nonce_data.blocking_send(NonceData {
+                    height: read_reply.info.height,
+                    block: read_reply.info.block,
+                    base_target: read_reply.info.base_target,
+                    deadline: u64::MAX,
+                    nonce: 0,
+                    reader_task_processed: read_reply.info.finished,
+                    drive_chunks: read_reply.info.drive_chunks,
+                    account_id: read_reply.info.account_id,
+                });
                 let _ = tx_empty_buffers.send(buffer);
                 continue;
             }
@@ -54,13 +51,14 @@ pub fn create_gpu_worker_task(
             let deadline = result.0;
             let offset = result.1;
 
-            let _ = tx_nonce_data.send(NonceData {
+            let _ = tx_nonce_data.blocking_send(NonceData {
                 height: read_reply.info.height,
                 block: read_reply.info.block,
                 base_target: read_reply.info.base_target,
                 deadline,
                 nonce: offset.saturating_add(read_reply.info.start_nonce),
                 reader_task_processed: read_reply.info.finished,
+                drive_chunks: read_reply.info.drive_chunks,
                 account_id: read_reply.info.account_id,
             });
 
@@ -77,7 +75,6 @@ mod tests {
     use hex;
     use ocl_core as core;
     use std::sync::Arc;
-    use std::u64;
 
     #[test]
     fn test_deadline_hashing() {

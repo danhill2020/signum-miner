@@ -10,13 +10,75 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test-x86:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: avx2 (default)
+            args: ""
+          - name: sse2
+            args: "--no-default-features --features simd_sse2"
+          - name: portable (no SIMD)
+            args: "--no-default-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - run: cargo build --release --verbose ${{ matrix.args }}
+      - run: cargo test --release --verbose ${{ matrix.args }}
+      - name: config check with the sample config
+        run: |
+          mkdir -p /tmp/plots
+          sed -e "s#^plot_dirs:.*#plot_dirs: ['test_data']#" -e "/^  - '/d" config.yaml > /tmp/config.yaml
+          ./target/release/signum-miner --config /tmp/config.yaml --check
+
+  check-opencl:
+    name: check (opencl feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --features opencl
+
+  test-aarch64:
+    name: build + test (aarch64, NEON, Raspberry Pi target)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross toolchain and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+      - name: Build with default features (build script must pick NEON)
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+      - name: Run the test suite under qemu
+        run: cargo test --release --target aarch64-unknown-linux-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signum-miner-aarch64-neon
+          path: target/aarch64-unknown-linux-gnu/release/signum-miner
