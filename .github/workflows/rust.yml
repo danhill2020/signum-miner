@@ -48,6 +48,11 @@ jobs:
           mkdir -p /tmp/plots
           sed -e "s#^plot_dirs:.*#plot_dirs: ['test_data']#" -e "/^  - '/d" config.yaml > /tmp/config.yaml
           ./target/release/signum-miner --config /tmp/config.yaml --check
+      - name: plotter smoke test (CPU)
+        run: |
+          mkdir -p /tmp/plots
+          ./target/release/signum-plotter --id 10282355196851764065 --path /tmp/plots --nonces 8 --threads 2
+          cmp -n 2097144 /tmp/plots/10282355196851764065_0_8 test_data/10282355196851764065_0_8
 
   gui-tests:
     name: GUI logic tests (python)
@@ -60,14 +65,30 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m unittest discover -s tests/ui -v
 
-  check-opencl:
-    name: check (opencl feature)
+  test-opencl:
+    name: build + test (opencl feature, pocl runtime)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --features opencl
+        with:
+          key: opencl
+      - name: Install an OpenCL runtime (pocl runs kernels on the CPU)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd
+      - run: cargo clippy --all-targets --features opencl -- -D warnings
+      - run: cargo build --release --features opencl
+      - run: cargo test --release --features opencl
+      - name: GPU plot matches the CPU reference plot
+        run: |
+          ./target/release/signum-plotter --list-devices
+          mkdir -p /tmp/gpu-plots
+          ./target/release/signum-plotter --id 10282355196851764065 --path /tmp/gpu-plots --nonces 8 --gpu 0:0
+          cmp -n 2097144 /tmp/gpu-plots/10282355196851764065_0_8 test_data/10282355196851764065_0_8
 
   test-aarch64:
     name: build + test (aarch64, NEON, Raspberry Pi target)
@@ -92,4 +113,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: signum-miner-aarch64-neon
-          path: target/aarch64-unknown-linux-gnu/release/signum-miner
+          path: |
+            target/aarch64-unknown-linux-gnu/release/signum-miner
+            target/aarch64-unknown-linux-gnu/release/signum-plotter

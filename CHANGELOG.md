@@ -70,6 +70,23 @@
 - Buffered reads (the fallback for filesystems without direct I/O) advise
   the kernel to read ahead and drop the pages afterwards.
 
+### Added (plotter and GUI)
+
+- `signum-plotter`, a PoC2 plotter built alongside the miner. CPU plotting
+  on all cores (rayon) and, with `--features opencl`, GPU plotting with one
+  OpenCL work-item per nonce (`--list-devices`, `--gpu P:D`). Generation and
+  writing overlap, the file is written scoop-major directly (no sort pass),
+  is preallocated, and is removed if the run fails. `--size-gb` or
+  `--nonces`, `--start-nonce` defaults to the end of the account's existing
+  plots in the directory, `--bench` measures the rate without writing.
+  Both paths are verified byte for byte against the independent reference
+  generator in the tests.
+- GUI: a Plotter page (account, directory picker, size, CPU threads or a
+  detected OpenCL device, progress/rate/ETA, benchmark), a round-time chart
+  of the last 120 rounds, a drives table with health from the disk health
+  report, `Ctrl+S` to save, an "Add folder…" button for plot directories,
+  and remembered window size, page, config file and plotter settings.
+
 ### Changed
 
 - Direct I/O is no longer disabled wholesale for USB drives; instead every

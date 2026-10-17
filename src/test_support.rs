@@ -4,74 +4,12 @@
 //! the miner's own read path, so it can be used to verify that the miner maps
 //! bytes on disk to the correct nonce numbers and deadlines.
 
-use std::os::raw::c_void;
+#[path = "plotter/poc2.rs"]
+#[allow(dead_code)]
+mod poc2;
 
-const HASH_SIZE: usize = 32;
-const SCOOP_SIZE: usize = 64;
-const SCOOPS_PER_NONCE: usize = 4096;
-const NONCE_SIZE: usize = SCOOP_SIZE * SCOOPS_PER_NONCE;
-const HASH_CAP: usize = 4096;
-
-extern "C" {
-    fn sph_shabal256_init(cc: *mut c_void);
-    fn sph_shabal256(cc: *mut c_void, data: *const u8, len: usize);
-    fn sph_shabal256_close(cc: *mut c_void, dst: *mut c_void);
-}
-
-/// Opaque storage for an `sph_shabal_context` (256 bytes on 64-bit targets).
-#[repr(C, align(16))]
-struct ShabalContext([u8; 512]);
-
-/// Generic Shabal-256 over an arbitrary-length message, via the bundled C code.
-pub fn shabal256(parts: &[&[u8]]) -> [u8; 32] {
-    let mut ctx = ShabalContext([0u8; 512]);
-    let mut out = [0u8; 32];
-    unsafe {
-        sph_shabal256_init(ctx.0.as_mut_ptr() as *mut c_void);
-        for part in parts {
-            sph_shabal256(ctx.0.as_mut_ptr() as *mut c_void, part.as_ptr(), part.len());
-        }
-        sph_shabal256_close(
-            ctx.0.as_mut_ptr() as *mut c_void,
-            out.as_mut_ptr() as *mut c_void,
-        );
-    }
-    out
-}
-
-/// Generate one PoC2 nonce (4096 scoops of 64 bytes) for `account_id`/`nonce`.
-pub fn generate_nonce(account_id: u64, nonce: u64) -> Vec<u8> {
-    let mut gendata = vec![0u8; NONCE_SIZE + 16];
-    gendata[NONCE_SIZE..NONCE_SIZE + 8].copy_from_slice(&account_id.to_be_bytes());
-    gendata[NONCE_SIZE + 8..NONCE_SIZE + 16].copy_from_slice(&nonce.to_be_bytes());
-
-    let mut i = NONCE_SIZE;
-    while i > 0 {
-        let mut len = NONCE_SIZE + 16 - i;
-        if len > HASH_CAP {
-            len = HASH_CAP;
-        }
-        let hash = shabal256(&[&gendata[i..i + len]]);
-        gendata[i - HASH_SIZE..i].copy_from_slice(&hash);
-        i -= HASH_SIZE;
-    }
-
-    let final_hash = shabal256(&[&gendata[..]]);
-    for (i, byte) in gendata.iter_mut().take(NONCE_SIZE).enumerate() {
-        *byte ^= final_hash[i % HASH_SIZE];
-    }
-    gendata.truncate(NONCE_SIZE);
-
-    // PoC2: swap the second hash of scoop s with the second hash of scoop 4095-s.
-    for s in 0..SCOOPS_PER_NONCE / 2 {
-        let a = s * SCOOP_SIZE + HASH_SIZE;
-        let b = (SCOOPS_PER_NONCE - 1 - s) * SCOOP_SIZE + HASH_SIZE;
-        for k in 0..HASH_SIZE {
-            gendata.swap(a + k, b + k);
-        }
-    }
-    gendata
-}
+pub use poc2::{generate_nonce, shabal256};
+use poc2::{NONCE_SIZE, SCOOPS_PER_NONCE, SCOOP_SIZE};
 
 /// The 64-byte scoop `scoop` of a generated nonce.
 pub fn scoop_of(nonce_data: &[u8], scoop: u32) -> &[u8] {

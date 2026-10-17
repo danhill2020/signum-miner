@@ -12,7 +12,7 @@ use std::ffi::CString;
 use std::process;
 use std::sync::{Arc, Mutex};
 
-static SRC: &'static str = include_str!("ocl/kernel.cl");
+static SRC: &str = include_str!("ocl/kernel.cl");
 const SCOOP_SIZE: u64 = 64;
 
 // convert the info or error to a string for printing:
@@ -34,10 +34,10 @@ pub fn platform_info() {
         info!(
             "OCL: platform {}, {} - {}",
             i,
-            to_string!(core::get_platform_info(&platform_id, PlatformInfo::Name)),
-            to_string!(core::get_platform_info(&platform_id, PlatformInfo::Version))
+            to_string!(core::get_platform_info(platform_id, PlatformInfo::Name)),
+            to_string!(core::get_platform_info(platform_id, PlatformInfo::Version))
         );
-        let device_ids = core::get_device_ids(&platform_id, None, None).unwrap();
+        let device_ids = core::get_device_ids(platform_id, None, None).unwrap();
         let context_properties = ContextProperties::new().platform(*platform_id);
         for (j, device_id) in device_ids.iter().enumerate() {
             info!(
@@ -89,7 +89,7 @@ pub fn gpu_info(cfg: &Cfg) {
             process::exit(0);
         }
         let platform = platform_ids[cfg.gpu_platform];
-        let device_ids = core::get_device_ids(&platform, None, None).unwrap();
+        let device_ids = core::get_device_ids(platform, None, None).unwrap();
         if cfg.gpu_device >= device_ids.len() {
             error!("OCL: Selected OpenCL device doesn't exist. Shutting down...");
             process::exit(0);
@@ -102,8 +102,8 @@ pub fn gpu_info(cfg: &Cfg) {
         );
         info!(
             "GPU: {} - {}",
-            to_string!(core::get_device_info(&device, DeviceInfo::Vendor)),
-            to_string!(core::get_device_info(&device, DeviceInfo::Name))
+            to_string!(core::get_device_info(device, DeviceInfo::Vendor)),
+            to_string!(core::get_device_info(device, DeviceInfo::Name))
         );
 
         let gpu_num_buffers = if cfg.gpu_worker_task_count > 0 {
@@ -116,12 +116,12 @@ pub fn gpu_info(cfg: &Cfg) {
             0
         };
 
-        match core::get_device_info(&device, DeviceInfo::GlobalMemSize).unwrap() {
+        match core::get_device_info(device, DeviceInfo::GlobalMemSize).unwrap() {
             core::DeviceInfoResult::GlobalMemSize(mem) => {
                 info!(
                     "GPU: RAM={}MiB, Cores={}",
                     mem / 1024 / 1024,
-                    to_string!(core::get_device_info(&device, DeviceInfo::MaxComputeUnits))
+                    to_string!(core::get_device_info(device, DeviceInfo::MaxComputeUnits))
                 );
                 info!(
                     "GPU: RAM usage (estimated)={}MiB",
@@ -194,11 +194,11 @@ impl GpuContext {
     ) -> GpuContext {
         let platform_ids = core::get_platform_ids().unwrap();
         let platform_id = platform_ids[gpu_platform];
-        let device_ids = core::get_device_ids(&platform_id, None, None).unwrap();
+        let device_ids = core::get_device_ids(platform_id, None, None).unwrap();
         let device_id = device_ids[gpu_id];
 
         let vendor =
-            to_string!(core::get_device_info(&device_id, DeviceInfo::Vendor)).to_uppercase();
+            to_string!(core::get_device_info(device_id, DeviceInfo::Vendor)).to_uppercase();
         let nvidia = vendor.contains("NVIDIA");
 
         let context_properties = ContextProperties::new().platform(platform_id);
@@ -214,8 +214,8 @@ impl GpuContext {
             None,
         )
         .unwrap();
-        let queue_compute = core::create_command_queue(&context, &device_id, None).unwrap();
-        let queue_transfer = core::create_command_queue(&context, &device_id, None).unwrap();
+        let queue_compute = core::create_command_queue(&context, device_id, None).unwrap();
+        let queue_transfer = core::create_command_queue(&context, device_id, None).unwrap();
 
         let kernel1 = core::create_kernel(&program, "calculate_deadlines").unwrap();
         let kernel2 = core::create_kernel(&program, "find_min").unwrap();
@@ -434,8 +434,8 @@ unsafe impl Sync for GpuContext {}
 unsafe impl Send for GpuBuffer {}
 
 pub fn gpu_transfer(gpu_context: &Arc<GpuContext>, buffer: &GpuBuffer, gensig: [u8; 32]) {
-    upload_gensig(&gpu_context, gensig, true);
-    transfer_buffer_to_gpu(&gpu_context, buffer, true);
+    upload_gensig(gpu_context, gensig, true);
+    transfer_buffer_to_gpu(gpu_context, buffer, true);
 }
 
 fn upload_gensig(gpu_context: &Arc<GpuContext>, gensig: [u8; 32], blocking: bool) {
@@ -461,7 +461,7 @@ fn transfer_buffer_to_gpu(gpu_context: &Arc<GpuContext>, buffer: &GpuBuffer, blo
         core::enqueue_unmap_mem_object(
             &gpu_context.queue_transfer,
             &buffer.data_gpu,
-            &*temp2,
+            temp2,
             None::<Event>,
             None::<&mut Event>,
         )
@@ -488,8 +488,8 @@ pub fn gpu_transfer_and_hash(
     nonce_count: usize,
     data_gpu: &core::Mem,
 ) -> (u64, u64) {
-    transfer_buffer_to_gpu(&gpu_context, buffer, false);
-    let result = gpu_hash(&gpu_context, nonce_count, data_gpu);
+    transfer_buffer_to_gpu(gpu_context, buffer, false);
+    let result = gpu_hash(gpu_context, nonce_count, data_gpu);
     core::finish(&gpu_context.queue_transfer).unwrap();
     result
 }
@@ -499,8 +499,8 @@ pub fn gpu_hash(
     nonce_count: usize,
     data_gpu: &core::Mem,
 ) -> (u64, u64) {
-    hash(&gpu_context, nonce_count, data_gpu);
-    get_result(&gpu_context)
+    hash(gpu_context, nonce_count, data_gpu);
+    get_result(gpu_context)
 }
 
 fn hash(gpu_context: &Arc<GpuContext>, nonce_count: usize, data_gpu: &core::Mem) {
@@ -510,7 +510,7 @@ fn hash(gpu_context: &Arc<GpuContext>, nonce_count: usize, data_gpu: &core::Mem)
         ArgVal::mem(&gpu_context.gensig_gpu),
     )
     .unwrap();
-    core::set_kernel_arg(&gpu_context.kernel1, 1, ArgVal::mem(&data_gpu)).unwrap();
+    core::set_kernel_arg(&gpu_context.kernel1, 1, ArgVal::mem(data_gpu)).unwrap();
     core::set_kernel_arg(
         &gpu_context.kernel1,
         2,
