@@ -1,29 +1,21 @@
-use crate::utils::get_sector_size;
-use rand::prelude::*;
 use std::cmp::{max, min};
 use std::error::Error;
-use std::fs;
-#[cfg(not(feature = "async_io"))]
-use std::fs::File as TokioFile;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
-#[cfg(feature = "async_io")]
-use std::io::Seek;
-use std::io::SeekFrom;
-#[cfg(not(feature = "async_io"))]
-use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "async_io")]
-use tokio::fs::File as TokioFile;
-#[cfg(feature = "async_io")]
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::buffer::{AlignedBuffer, BUFFER_ALIGNMENT};
 
 const SCOOPS_IN_NONCE: u64 = 4096;
 const SHABAL256_HASH_SIZE: u64 = 32;
 pub const SCOOP_SIZE: u64 = SHABAL256_HASH_SIZE * 2;
-const NONCE_SIZE: u64 = SCOOP_SIZE * SCOOPS_IN_NONCE;
+pub const NONCE_SIZE: u64 = SCOOP_SIZE * SCOOPS_IN_NONCE;
 
-#[derive(Clone)]
+/// Alignment required for direct I/O offsets and lengths.  See `buffer.rs`.
+pub const DIRECT_IO_ALIGNMENT: u64 = BUFFER_ALIGNMENT as u64;
+
+#[derive(Clone, Debug)]
 pub struct Meta {
     pub account_id: u64,
     pub start_nonce: u64,
@@ -51,39 +43,77 @@ impl Meta {
     }
 }
 
+/// Parse a plot file name of the form `<account>_<start_nonce>_<nonces>`.
+pub fn parse_plot_name(name: &str) -> Option<(u64, u64, u64)> {
+    let parts: Vec<&str> = name.split('_').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let account_id = parts[0].parse::<u64>().ok()?;
+    let start_nonce = parts[1].parse::<u64>().ok()?;
+    let nonces = parts[2].parse::<u64>().ok()?;
+    if nonces == 0 {
+        return None;
+    }
+    start_nonce.checked_add(nonces)?;
+    nonces.checked_mul(NONCE_SIZE)?;
+    Some((account_id, start_nonce, nonces))
+}
+
 pub struct Plot {
     pub meta: Meta,
-    pub path: String,
-    pub fh: TokioFile,
+    pub path: PathBuf,
+    /// `None` for a plot that is currently unreadable (drive went away); it is
+    /// reopened at the start of every round and simply skipped until it is back.
+    fh: Option<File>,
+    /// Byte offset of the current scoop's region inside the file.
+    scoop_base: u64,
+    /// Bytes of the current scoop already handed out (including the alignment skip).
     read_offset: u64,
-    align_offset: u64,
-    seek_base: u64,
     use_direct_io: bool,
-    sector_size: u64,
     dummy: bool,
 }
 
 cfg_if! {
     if #[cfg(unix)] {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        const O_DIRECT: i32 = 0o0_040_000;
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        use std::os::unix::io::AsRawFd;
 
         pub fn open_using_direct_io<P: AsRef<Path>>(path: P) -> io::Result<File> {
             OpenOptions::new()
                 .read(true)
-                .custom_flags(O_DIRECT)
+                .custom_flags(libc::O_DIRECT)
                 .open(path)
         }
 
         pub fn open<P: AsRef<Path>>(path: P) -> io::Result<File> {
-            OpenOptions::new()
-                .read(true)
-                .open(path)
+            let fh = OpenOptions::new().read(true).open(path)?;
+            // Buffered fallback: tell the kernel the access is sequential so
+            // it reads ahead aggressively (USB drives need a full queue).
+            unsafe {
+                libc::posix_fadvise(fh.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            }
+            Ok(fh)
         }
 
+        fn read_exact_at(fh: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+            fh.read_exact_at(buf, offset)
+        }
+
+        /// After a buffered read, drop the pages again: scoop data is never
+        /// re-read, and on a Pi the page cache is better spent elsewhere.
+        fn drop_cache(fh: &File, offset: u64, len: usize) {
+            unsafe {
+                libc::posix_fadvise(
+                    fh.as_raw_fd(),
+                    offset as libc::off_t,
+                    len as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+        }
     } else {
-        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::fs::{FileExt, OpenOptionsExt};
 
         const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
         const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
@@ -101,31 +131,43 @@ cfg_if! {
                 .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
                 .open(path)
         }
+
+        fn read_exact_at(fh: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+            while !buf.is_empty() {
+                match fh.seek_read(buf, offset) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "failed to fill whole buffer",
+                        ))
+                    }
+                    Ok(n) => {
+                        buf = &mut buf[n..];
+                        offset += n as u64;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+
+        fn drop_cache(_fh: &File, _offset: u64, _len: usize) {}
     }
 }
 
 impl Plot {
-    pub fn new(
-        path: &PathBuf,
-        mut use_direct_io: bool,
-        dummy: bool,
-    ) -> Result<Plot, Box<dyn Error>> {
+    pub fn new(path: &Path, use_direct_io: bool, dummy: bool) -> Result<Plot, Box<dyn Error>> {
         if !path.is_file() {
-            return Err(From::from(format!(
-                "{} is not a file",
-                path.to_str().unwrap()
-            )));
+            return Err(From::from(format!("{} is not a file", path.display())));
         }
 
-        let plot_file = path.file_name().unwrap().to_str().unwrap();
-        let parts: Vec<&str> = plot_file.split('_').collect();
-        if parts.len() != 3 {
-            return Err(From::from("plot file has wrong format"));
-        }
-
-        let account_id = parts[0].parse::<u64>()?;
-        let start_nonce = parts[1].parse::<u64>()?;
-        let nonces = parts[2].parse::<u64>()?;
+        let plot_file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("plot file name is not valid UTF-8")?;
+        let (account_id, start_nonce, nonces) =
+            parse_plot_name(plot_file).ok_or("plot file has wrong format")?;
 
         let size = fs::metadata(path)?.len();
         let exp_size = nonces * NONCE_SIZE;
@@ -136,225 +178,334 @@ impl Plot {
             )));
         }
 
-        let fh_std = if use_direct_io {
-            open_using_direct_io(path)?
-        } else {
-            open(path)?
-        };
-        let fh = {
-            #[cfg(feature = "async_io")]
-            {
-                TokioFile::from_std(fh_std)
-            }
-            #[cfg(not(feature = "async_io"))]
-            {
-                fh_std
-            }
-        };
-
-        let plot_file_name = plot_file.to_string();
-        let sector_size = get_sector_size(path.to_str().unwrap());
-        if use_direct_io && sector_size / 64 > nonces {
+        let mut use_direct_io = use_direct_io;
+        if use_direct_io && nonces * SCOOP_SIZE < DIRECT_IO_ALIGNMENT {
             warn!(
-                "not enough nonces for using direct io: plot={}",
-                plot_file_name
+                "not enough nonces for using direct io, falling back to buffered reads: plot={}",
+                plot_file
             );
             use_direct_io = false;
         }
 
-        let file_path = path.clone().into_os_string().into_string().unwrap();
+        let fh = if use_direct_io {
+            match open_using_direct_io(path) {
+                Ok(fh) => fh,
+                Err(e) => {
+                    warn!(
+                        "direct I/O not available for {} ({}), falling back to buffered reads",
+                        plot_file, e
+                    );
+                    use_direct_io = false;
+                    open(path)?
+                }
+            }
+        } else {
+            open(path)?
+        };
+
         Ok(Plot {
             meta: Meta {
                 account_id,
                 start_nonce,
                 nonces,
-                name: plot_file_name,
+                name: plot_file.to_string(),
             },
-            fh,
-            path: file_path,
+            fh: Some(fh),
+            path: path.to_path_buf(),
+            scoop_base: 0,
             read_offset: 0,
-            align_offset: 0,
-            seek_base: 0,
             use_direct_io,
-            sector_size,
             dummy,
         })
     }
 
-    #[cfg(not(feature = "async_io"))]
-    pub fn prepare(&mut self, scoop: u32) -> io::Result<u64> {
-        self.read_offset = 0;
-        self.align_offset = 0;
-        let nonces = self.meta.nonces;
-        let mut seek_addr = u64::from(scoop) * nonces * SCOOP_SIZE;
-
-        // reopening file handles
-        if !self.use_direct_io {
-            self.fh = open(&self.path)?;
-        } else {
-            self.fh = open_using_direct_io(&self.path)?;
-        };
-
-        if self.use_direct_io {
-            self.align_offset = self.round_seek_addr(&mut seek_addr);
+    /// A plot that was seen before but cannot be opened right now.  It keeps
+    /// its place (and its capacity) and is retried every round.
+    pub fn placeholder(meta: Meta, path: PathBuf, use_direct_io: bool, dummy: bool) -> Plot {
+        Plot {
+            meta,
+            path,
+            fh: None,
+            scoop_base: 0,
+            read_offset: 0,
+            use_direct_io,
+            dummy,
         }
-        self.seek_base = seek_addr;
-
-        self.fh.seek(SeekFrom::Start(seek_addr + self.align_offset))
     }
 
-    #[cfg(feature = "async_io")]
-    pub async fn prepare_async(&mut self, scoop: u32) -> io::Result<u64> {
-        self.read_offset = 0;
-        self.align_offset = 0;
-        let nonces = self.meta.nonces;
-        let mut seek_addr = u64::from(scoop) * nonces * SCOOP_SIZE;
-
-        if !self.use_direct_io {
-            let f = open(&self.path)?;
-            self.fh = TokioFile::from_std(f);
-        } else {
-            let f = open_using_direct_io(&self.path)?;
-            self.fh = TokioFile::from_std(f);
-        };
-
-        if self.use_direct_io {
-            self.align_offset = self.round_seek_addr(&mut seek_addr);
-        }
-        self.seek_base = seek_addr;
-
-        self.fh
-            .seek(SeekFrom::Start(seek_addr + self.align_offset))
-            .await
+    #[cfg(test)]
+    pub fn is_open(&self) -> bool {
+        self.fh.is_some()
     }
 
-    #[cfg(not(feature = "async_io"))]
-    pub fn read(&mut self, bs: &mut Vec<u8>, scoop: u32) -> Result<(usize, u64, bool), io::Error> {
-        let read_offset = self.read_offset;
-        let buffer_cap = bs.capacity();
-        let start_nonce =
-            self.meta.start_nonce + u64::from(scoop) * self.meta.nonces + self.read_offset / 64;
+    pub fn uses_direct_io(&self) -> bool {
+        self.use_direct_io
+    }
 
-        let (bytes_to_read, finished) =
-            if read_offset as usize + buffer_cap >= (SCOOP_SIZE * self.meta.nonces) as usize {
-                let mut bytes_to_read =
-                    (SCOOP_SIZE * self.meta.nonces) as usize - self.read_offset as usize;
-                if self.use_direct_io {
-                    let r = bytes_to_read % self.sector_size as usize;
-                    if r != 0 {
-                        bytes_to_read -= r;
-                    }
+    /// Size in bytes of one scoop across all nonces of this plot.
+    fn scoop_bytes(&self) -> u64 {
+        self.meta.nonces * SCOOP_SIZE
+    }
+
+    fn reopen(&mut self) -> io::Result<()> {
+        if self.use_direct_io {
+            match open_using_direct_io(&self.path) {
+                Ok(fh) => {
+                    self.fh = Some(fh);
+                    return Ok(());
                 }
-
-                (bytes_to_read, true)
-            } else {
-                (buffer_cap, false)
-            };
-
-        let offset = self.read_offset;
-        if !self.dummy {
-            if offset == 0 {
-                self.fh
-                    .seek(SeekFrom::Start(self.seek_base + self.align_offset))?;
+                Err(e) => {
+                    warn!(
+                        "direct I/O open failed for {} ({}), switching to buffered reads",
+                        self.meta.name, e
+                    );
+                    self.use_direct_io = false;
+                }
             }
-            self.fh.read_exact(&mut bs[0..bytes_to_read])?;
-            // interrupt avoider (not implemented)
-            // let read_chunk_size_in_nonces = 65536;
-            // for i in (0..bytes_to_read).step_by(read_chunk_size_in_nonces) {
-            //     self.fh.read_exact(
-            //         &mut bs[i..(i + min(read_chunk_size_in_nonces, bytes_to_read - i))],
-            //     )?;
-            // }
+        }
+        self.fh = Some(open(&self.path)?);
+        Ok(())
+    }
+
+    /// Position the plot at the start of `scoop` for a new round.
+    ///
+    /// The file is reopened every round so a drive that went away and came
+    /// back (USB bays do that) is picked up again without a restart.
+    pub fn prepare(&mut self, scoop: u32) -> io::Result<()> {
+        self.reopen()?;
+        self.position(scoop);
+        Ok(())
+    }
+
+    /// Offset bookkeeping for a new scoop, separated from the reopen so the
+    /// alignment logic can be tested without a filesystem that supports
+    /// direct I/O.
+    fn position(&mut self, scoop: u32) {
+        self.scoop_base = u64::from(scoop) * self.scoop_bytes();
+        self.read_offset = 0;
+        if self.use_direct_io {
+            // Direct I/O needs an aligned file offset.  Skip forward to the
+            // next aligned position; the (at most 63) nonces skipped are
+            // accounted for in `read_offset`, so start nonces stay correct.
+            let r = self.scoop_base % DIRECT_IO_ALIGNMENT;
+            if r != 0 {
+                self.read_offset = DIRECT_IO_ALIGNMENT - r;
+            }
+        }
+    }
+
+    /// Read the next chunk of the current scoop into `bs`.
+    ///
+    /// Returns `(bytes_read, start_nonce, finished)` where `start_nonce` is the
+    /// nonce number of the first 64-byte scoop in `bs`.
+    pub fn read(&mut self, bs: &mut AlignedBuffer) -> io::Result<(usize, u64, bool)> {
+        let scoop_bytes = self.scoop_bytes();
+        let remaining = scoop_bytes.saturating_sub(self.read_offset);
+        let buffer_cap = bs.len() as u64;
+        let start_nonce = self.meta.start_nonce + self.read_offset / SCOOP_SIZE;
+
+        let (mut bytes_to_read, finished) = if buffer_cap >= remaining {
+            (remaining, true)
+        } else {
+            (buffer_cap, false)
+        };
+        if self.use_direct_io {
+            // Direct I/O also needs an aligned length; the tail of the scoop
+            // (at most 63 nonces) is dropped, as it always has been.
+            bytes_to_read -= bytes_to_read % DIRECT_IO_ALIGNMENT;
+        }
+        let bytes_to_read = bytes_to_read as usize;
+
+        if !self.dummy && bytes_to_read > 0 {
+            let offset = self.scoop_base + self.read_offset;
+            let fh = self
+                .fh
+                .as_ref()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "plot file is not open"))?;
+            if let Err(e) = read_exact_at(fh, &mut bs[..bytes_to_read], offset) {
+                if self.use_direct_io && e.kind() == io::ErrorKind::InvalidInput {
+                    // The filesystem accepted O_DIRECT on open but rejects the
+                    // transfer (FUSE, some network filesystems).  Retry buffered.
+                    warn!(
+                        "direct I/O read rejected for {} ({}), switching to buffered reads",
+                        self.meta.name, e
+                    );
+                    self.use_direct_io = false;
+                    let fh = open(&self.path)?;
+                    read_exact_at(&fh, &mut bs[..bytes_to_read], offset)?;
+                    drop_cache(&fh, offset, bytes_to_read);
+                    self.fh = Some(fh);
+                } else {
+                    return Err(e);
+                }
+            } else if !self.use_direct_io {
+                drop_cache(fh, offset, bytes_to_read);
+            }
         }
         self.read_offset += bytes_to_read as u64;
 
         Ok((bytes_to_read, start_nonce, finished))
     }
 
-    #[cfg(feature = "async_io")]
-    pub async fn read_async(
-        &mut self,
-        bs: &mut Vec<u8>,
-        scoop: u32,
-    ) -> Result<(usize, u64, bool), io::Error> {
-        let read_offset = self.read_offset;
-        let buffer_cap = bs.capacity();
-        let start_nonce =
-            self.meta.start_nonce + u64::from(scoop) * self.meta.nonces + self.read_offset / 64;
+    /// Touch the drive by reading one block from a random scoop.
+    ///
+    /// A bare seek never reaches the device, so it cannot keep an external
+    /// enclosure from spinning down; an actual read can.
+    pub fn wakeup(&mut self) -> io::Result<()> {
+        let rand_scoop = pseudo_random() % SCOOPS_IN_NONCE;
+        let mut addr = rand_scoop * self.scoop_bytes();
+        addr -= addr % DIRECT_IO_ALIGNMENT;
+        let len = min(DIRECT_IO_ALIGNMENT, self.meta.nonces * NONCE_SIZE - addr) as usize;
+        let mut buf = AlignedBuffer::new(DIRECT_IO_ALIGNMENT as usize);
+        self.reopen()?;
+        let fh = self.fh.as_ref().expect("reopen sets the file handle");
+        read_exact_at(fh, &mut buf[..len], addr)
+    }
+}
 
-        let (bytes_to_read, finished) =
-            if read_offset as usize + buffer_cap >= (SCOOP_SIZE * self.meta.nonces) as usize {
-                let mut bytes_to_read =
-                    (SCOOP_SIZE * self.meta.nonces) as usize - self.read_offset as usize;
-                if self.use_direct_io {
-                    let r = bytes_to_read % self.sector_size as usize;
-                    if r != 0 {
-                        bytes_to_read -= r;
-                    }
-                }
-                (bytes_to_read, true)
-            } else {
-                (buffer_cap, false)
-            };
+/// A cheap, dependency-free random number good enough for picking a scoop.
+fn pseudo_random() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut x = nanos ^ 0x9E37_79B9_7F4A_7C15;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
 
-        let offset = self.read_offset;
-        if !self.dummy {
-            if offset == 0 {
-                self.fh
-                    .seek(SeekFrom::Start(self.seek_base + self.align_offset))
-                    .await?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{generate_nonce, scoop_of};
+
+    const TEST_ACCOUNT: u64 = 10282355196851764065;
+
+    fn test_plot_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data")
+            .join(format!("{}_0_8", TEST_ACCOUNT))
+    }
+
+    /// Reads every chunk of `scoop` with a buffer holding `nonces_per_chunk`
+    /// nonces and checks that each reported start nonce matches the bytes on
+    /// disk for that nonce.
+    fn assert_chunks_map_to_nonces(plot: &mut Plot, scoop: u32, nonces_per_chunk: usize) {
+        let nonce_images: Vec<Vec<u8>> = (0..8).map(|n| generate_nonce(TEST_ACCOUNT, n)).collect();
+
+        plot.prepare(scoop).expect("prepare");
+        let mut buf = AlignedBuffer::new(nonces_per_chunk * SCOOP_SIZE as usize);
+        let mut seen = 0u64;
+        loop {
+            let (bytes, start_nonce, finished) = plot.read(&mut buf).expect("read");
+            assert_eq!(bytes % SCOOP_SIZE as usize, 0);
+            assert_eq!(start_nonce, seen, "chunk start nonce for scoop {}", scoop);
+            for k in 0..bytes / SCOOP_SIZE as usize {
+                let nonce = start_nonce + k as u64;
+                let expected = scoop_of(&nonce_images[nonce as usize], scoop);
+                let got = &buf[k * 64..k * 64 + 64];
+                assert_eq!(got, expected, "scoop {} nonce {}", scoop, nonce);
             }
-            self.fh.read_exact(&mut bs[0..bytes_to_read]).await?;
+            seen += (bytes / 64) as u64;
+            if finished {
+                break;
+            }
         }
-        self.read_offset += bytes_to_read as u64;
-
-        Ok((bytes_to_read, start_nonce, finished))
+        assert_eq!(seen, 8, "all nonces of scoop {} read", scoop);
     }
 
-    #[cfg(not(feature = "async_io"))]
-    pub fn seek_random(&mut self) -> io::Result<u64> {
-        let mut rng = thread_rng();
-        let rand_scoop = rng.gen_range(0, SCOOPS_IN_NONCE);
-
-        let mut seek_addr = rand_scoop as u64 * self.meta.nonces * SCOOP_SIZE;
-        if self.use_direct_io {
-            self.round_seek_addr(&mut seek_addr);
+    #[test]
+    fn read_maps_bytes_to_correct_nonces_for_several_scoops() {
+        for scoop in [0u32, 1, 7, 2048, 4094] {
+            let mut plot = Plot::new(&test_plot_path(), false, false).expect("open plot");
+            assert_chunks_map_to_nonces(&mut plot, scoop, 3);
+            assert_chunks_map_to_nonces(&mut plot, scoop, 8);
+            assert_chunks_map_to_nonces(&mut plot, scoop, 64);
         }
-
-        self.fh.seek(SeekFrom::Start(seek_addr))
     }
 
-    #[cfg(feature = "async_io")]
-    pub fn seek_random(&mut self) -> io::Result<u64> {
-        let mut rng = thread_rng();
-        let rand_scoop = rng.gen_range(0, SCOOPS_IN_NONCE);
+    #[test]
+    fn parse_plot_name_accepts_valid_and_rejects_junk() {
+        assert_eq!(parse_plot_name("123_0_1000"), Some((123, 0, 1000)));
+        assert_eq!(parse_plot_name("123_5_0"), None);
+        assert_eq!(parse_plot_name("123_0"), None);
+        assert_eq!(parse_plot_name("a_b_c"), None);
+        assert_eq!(parse_plot_name("123_18446744073709551615_2"), None);
+    }
 
-        let mut seek_addr = rand_scoop as u64 * self.meta.nonces * SCOOP_SIZE;
-        if self.use_direct_io {
-            self.round_seek_addr(&mut seek_addr);
-        }
+    #[test]
+    fn tiny_plot_never_uses_direct_io() {
+        // 8 nonces * 64 bytes is below the 4 KiB alignment, so direct I/O
+        // must be refused regardless of the request.
+        let plot = Plot::new(&test_plot_path(), true, false).expect("open plot");
+        assert!(!plot.uses_direct_io());
+    }
 
-        let mut f = if self.use_direct_io {
-            open_using_direct_io(&self.path)?
-        } else {
-            open(&self.path)?
+    #[test]
+    fn direct_io_alignment_math_keeps_start_nonce_correct() {
+        // Simulate a 100-nonce plot (6400 bytes per scoop, not 4 KiB aligned).
+        // Scoop 1 starts at byte 6400; the aligned start is 8192, i.e. 1792
+        // bytes = 28 nonces later.  Those nonces are skipped and the start
+        // nonce reported for the first chunk must reflect that.
+        let dir = std::env::temp_dir().join(format!("signum-miner-align-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1_0_100");
+        std::fs::write(&path, vec![0u8; 100 * NONCE_SIZE as usize]).unwrap();
+
+        let mut plot = Plot::new(&path, true, true).expect("open plot");
+        // `dummy` mode skips the actual read so this works even where O_DIRECT
+        // is unsupported; the offset bookkeeping is what we are testing.
+        plot.use_direct_io = true;
+        plot.position(1);
+        let mut buf = AlignedBuffer::new(4096);
+        let (bytes, start_nonce, finished) = plot.read(&mut buf).unwrap();
+        assert_eq!(start_nonce, 28);
+        assert_eq!(bytes, 4096);
+        assert!(!finished);
+        let (bytes, start_nonce, finished) = plot.read(&mut buf).unwrap();
+        assert_eq!(start_nonce, 28 + 64);
+        // 6400 - 1792 - 4096 = 512 bytes remain, below one alignment unit.
+        assert_eq!(bytes, 0);
+        assert!(finished);
+
+        plot.position(0);
+        let (bytes, start_nonce, _) = plot.read(&mut buf).unwrap();
+        assert_eq!((bytes, start_nonce), (4096, 0));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn placeholder_plot_fails_prepare_until_file_exists() {
+        let dir = std::env::temp_dir().join(format!("signum-miner-ph-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("7_0_8");
+        let meta = Meta {
+            account_id: 7,
+            start_nonce: 0,
+            nonces: 8,
+            name: "7_0_8".into(),
         };
+        let mut plot = Plot::placeholder(meta, path.clone(), false, false);
+        assert!(!plot.is_open());
+        assert!(plot.prepare(3).is_err());
+        let mut buf = AlignedBuffer::new(512);
+        assert!(plot.read(&mut buf).is_err());
 
-        f.seek(SeekFrom::Start(seek_addr))
+        std::fs::copy(test_plot_path(), &path).unwrap();
+        plot.prepare(3).expect("prepare once the file is back");
+        assert!(plot.is_open());
+        let (bytes, start_nonce, finished) = plot.read(&mut buf).unwrap();
+        assert_eq!((bytes, start_nonce, finished), (512, 0, true));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    fn round_seek_addr(&mut self, seek_addr: &mut u64) -> u64 {
-        // Align file offset to the underlying sector size without skipping
-        // the beginning of the scoop.  Older logic aligned upwards which
-        // resulted in bytes at the start of a scoop being silently ignored
-        // when using direct I/O.  This caused nonce calculation to be off by
-        // the alignment delta when `async_io` was enabled.  Aligning downwards
-        // preserves all bytes while still satisfying the O_DIRECT requirement.
-
-        let r = *seek_addr % self.sector_size;
-        if r != 0 {
-            *seek_addr -= r;
-        }
-        r
+    #[test]
+    fn wakeup_reads_without_error() {
+        let mut plot = Plot::new(&test_plot_path(), false, false).expect("open plot");
+        plot.wakeup().expect("wakeup read");
     }
 }

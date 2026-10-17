@@ -1,7 +1,10 @@
 use crate::com::api::{FetchError, MiningInfoResponse};
 use crate::com::client::{Client, ProxyDetails, SubmissionParameters};
 use crate::future::prio_retry::PrioRetry;
-use futures_util::stream::{StreamExt};
+use crate::metrics::SharedMetrics;
+use crate::miner::Submission;
+use crate::utils::write_or_recover;
+use futures_util::stream::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -15,6 +18,7 @@ pub struct RequestHandler {
 }
 
 impl RequestHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_uri: Url,
         secret_phrases: HashMap<u64, String>,
@@ -22,8 +26,9 @@ impl RequestHandler {
         total_size_gb: usize,
         send_proxy_details: bool,
         additional_headers: HashMap<String, String>,
+        metrics: SharedMetrics,
         handle: tokio::runtime::Handle,
-    ) -> RequestHandler {
+    ) -> Result<RequestHandler, String> {
         let proxy_details = if send_proxy_details {
             ProxyDetails::Enabled
         } else {
@@ -37,26 +42,28 @@ impl RequestHandler {
             total_size_gb,
             proxy_details,
             additional_headers,
-        );
+        )?;
 
         let (tx_submit_data, rx_submit_nonce_data) = mpsc::unbounded_channel();
         RequestHandler::handle_submissions(
             client.clone(),
             rx_submit_nonce_data,
             tx_submit_data.clone(),
+            metrics,
             handle,
         );
 
-        RequestHandler {
+        Ok(RequestHandler {
             client,
             tx_submit_data,
-        }
+        })
     }
 
     fn handle_submissions(
         client: Client,
         rx: mpsc::UnboundedReceiver<SubmissionParameters>,
         tx_submit_data: mpsc::UnboundedSender<SubmissionParameters>,
+        metrics: SharedMetrics,
         handle: tokio::runtime::Handle,
     ) {
         handle.spawn(async move {
@@ -66,7 +73,7 @@ impl RequestHandler {
             let mut stream = Box::pin(stream);
             while let Some(submission_params) = stream.as_mut().next().await {
                 let tx_submit_data = tx_submit_data.clone();
-                let result = client.clone().submit_nonce(&submission_params).await;
+                let result = client.submit_nonce(&submission_params).await;
 
                 match result {
                     Ok(res) => {
@@ -78,10 +85,15 @@ impl RequestHandler {
                                 submission_params.deadline,
                                 res.deadline,
                             );
+                            write_or_recover(&metrics).record_submission_failure();
                         } else {
                             log_submission_accepted(
                                 submission_params.account_id,
                                 submission_params.nonce,
+                                submission_params.deadline,
+                            );
+                            write_or_recover(&metrics).record_submission_success(
+                                submission_params.account_id,
                                 submission_params.deadline,
                             );
                         }
@@ -105,6 +117,7 @@ impl RequestHandler {
                                 e.code,
                                 &e.message,
                             );
+                            write_or_recover(&metrics).record_submission_failure();
                         }
                     }
                     Err(FetchError::Http(x)) => {
@@ -114,6 +127,7 @@ impl RequestHandler {
                             submission_params.deadline,
                             &x.to_string(),
                         );
+                        write_or_recover(&metrics).record_network_error();
                         if tx_submit_data.send(submission_params).is_err() {
                             error!("can't send submission params");
                         }
@@ -123,42 +137,28 @@ impl RequestHandler {
         });
     }
 
-    pub fn get_mining_info<'a>(&'a self) -> impl std::future::Future<Output = Result<MiningInfoResponse, FetchError>> + 'a {
+    pub fn get_mining_info(
+        &self,
+    ) -> impl std::future::Future<Output = Result<MiningInfoResponse, FetchError>> + '_ {
         self.client.get_mining_info()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn submit_nonce(
-        &self,
-        account_id: u64,
-        nonce: u64,
-        height: u64,
-        block: u64,
-        deadline_unadjusted: u64,
-        deadline: u64,
-        gen_sig: [u8; 32],
-    ) {
+    pub fn submit_nonce(&self, submission: Submission) {
         let res = self.tx_submit_data.send(SubmissionParameters {
-            account_id,
-            nonce,
-            height,
-            block,
-            deadline_unadjusted,
-            deadline,
-            gen_sig,
+            account_id: submission.account_id,
+            nonce: submission.nonce,
+            height: submission.height,
+            block: submission.block,
+            deadline_unadjusted: submission.deadline_unadjusted,
+            deadline: submission.deadline,
+            gen_sig: submission.gen_sig,
         });
         if let Err(e) = res {
             error!("can't send submission params: {}", e);
         }
     }
 
-    #[cfg(feature = "async_io")]
-    pub async fn update_capacity(&mut self, total_size_gb: usize) {
-        self.client.update_capacity(total_size_gb).await;
-    }
-
-    #[cfg(not(feature = "async_io"))]
-    pub fn update_capacity(&mut self, total_size_gb: usize) {
+    pub fn update_capacity(&self, total_size_gb: usize) {
         self.client.update_capacity(total_size_gb);
     }
 }
@@ -219,30 +219,35 @@ fn log_pool_busy(account_id: u64, nonce: u64, deadline: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::new_shared_metrics;
     use std::collections::HashMap;
     use tokio::runtime::Runtime;
 
-    static BASE_URL: &str = "http://94.130.178.37:31000";
-
     #[test]
-    fn test_submit_nonce() {
-    use url::Url; // sicherstellen, dass url::Url verwendet wird
-    let rt = Runtime::new().expect("can't create runtime");
-    let handle = rt.handle().clone();
+    fn submit_nonce_enqueues_without_a_live_server() {
+        let rt = Runtime::new().expect("can't create runtime");
+        let handle = rt.handle().clone();
 
-    // erzwinge url::Url statt reqwest::Url
-    let base_url: Url = BASE_URL.parse().expect("invalid URL");
+        let request_handler = RequestHandler::new(
+            Url::parse("http://127.0.0.1:9").unwrap(),
+            HashMap::new(),
+            300,
+            12,
+            true,
+            HashMap::new(),
+            new_shared_metrics(),
+            handle,
+        )
+        .unwrap();
 
-    let request_handler = RequestHandler::new(
-        base_url,
-        HashMap::new(),
-        3,
-        12,
-        true,
-        HashMap::new(),
-        handle,
-    );
-
-    request_handler.submit_nonce(1337, 12, 111, 0, 7123, 1193, [0; 32]);
-}
+        request_handler.submit_nonce(Submission {
+            account_id: 1337,
+            nonce: 12,
+            height: 111,
+            block: 0,
+            deadline_unadjusted: 7123,
+            deadline: 1193,
+            gen_sig: [0; 32],
+        });
+    }
 }

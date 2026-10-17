@@ -1,10 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
-#[cfg(feature = "async_io")]
-use tokio::sync::RwLock;
-#[cfg(not(feature = "async_io"))]
-use std::sync::RwLock;
 
 /// Comprehensive metrics tracking for the miner
 /// Some fields and methods are intentionally kept for future monitoring/debugging use
@@ -101,7 +97,8 @@ impl MinerMetrics {
 
         // Update average round time using exponential moving average
         let alpha = 0.1; // Smoothing factor
-        self.avg_round_time_ms = alpha * duration_ms as f64 + (1.0 - alpha) * self.avg_round_time_ms;
+        self.avg_round_time_ms =
+            alpha * duration_ms as f64 + (1.0 - alpha) * self.avg_round_time_ms;
     }
 
     /// Record a failed round
@@ -112,7 +109,10 @@ impl MinerMetrics {
     /// Record an I/O error for a specific drive
     pub fn record_io_error(&mut self, drive_id: &str) {
         self.total_io_errors += 1;
-        *self.io_errors_by_drive.entry(drive_id.to_string()).or_insert(0) += 1;
+        *self
+            .io_errors_by_drive
+            .entry(drive_id.to_string())
+            .or_insert(0) += 1;
     }
 
     /// Record a network error
@@ -164,15 +164,28 @@ impl MinerMetrics {
         let mut summary = String::new();
         summary.push_str("=== MINER METRICS ===\n");
         summary.push_str(&format!("Uptime: {}\n", self.uptime_formatted()));
-        summary.push_str(&format!("Rounds: {} completed, {} failed ({:.1}% success)\n",
-            self.rounds_completed, self.rounds_failed, self.round_success_rate()));
-        summary.push_str(&format!("Avg Round Time: {:.0}ms\n", self.avg_round_time_ms));
-        summary.push_str(&format!("Submissions: {} total, {} successful, {} failed ({:.1}% success)\n",
-            self.total_submissions, self.successful_submissions, self.failed_submissions,
-            self.submission_success_rate()));
-        summary.push_str(&format!("Data Read: {:.2} TiB (avg {:.2} MiB/s)\n",
+        summary.push_str(&format!(
+            "Rounds: {} completed, {} failed ({:.1}% success)\n",
+            self.rounds_completed,
+            self.rounds_failed,
+            self.round_success_rate()
+        ));
+        summary.push_str(&format!(
+            "Avg Round Time: {:.0}ms\n",
+            self.avg_round_time_ms
+        ));
+        summary.push_str(&format!(
+            "Submissions: {} total, {} successful, {} failed ({:.1}% success)\n",
+            self.total_submissions,
+            self.successful_submissions,
+            self.failed_submissions,
+            self.submission_success_rate()
+        ));
+        summary.push_str(&format!(
+            "Data Read: {:.2} TiB (avg {:.2} MiB/s)\n",
             self.total_bytes_read as f64 / 1024.0 / 1024.0 / 1024.0 / 1024.0,
-            self.avg_read_speed_mibs()));
+            self.avg_read_speed_mibs()
+        ));
         summary.push_str(&format!("I/O Errors: {} total\n", self.total_io_errors));
         summary.push_str(&format!("Network Errors: {}\n", self.network_errors));
 
@@ -327,8 +340,12 @@ impl DiskHealthMonitor {
 
             summary.push_str(&format!(
                 "Drive {}: {} (errors: {}/{}, rate: {:.2}%, consecutive: {})\n",
-                drive_id, status, info.failed_reads, info.total_reads,
-                info.error_rate(), info.consecutive_errors
+                drive_id,
+                status,
+                info.failed_reads,
+                info.total_reads,
+                info.error_rate(),
+                info.consecutive_errors
             ));
         }
 

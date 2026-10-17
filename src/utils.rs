@@ -1,3 +1,39 @@
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// Lock a mutex, recovering the inner value if a thread panicked while holding it.
+///
+/// Release builds abort on panic so poisoning cannot happen there; this keeps
+/// the test profile (which unwinds) from cascading one failure into many.
+pub fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            error!("mutex poisoned, recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
+pub fn read_or_recover<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            error!("rwlock poisoned, recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
+pub fn write_or_recover<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            error!("rwlock poisoned, recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
 pub fn new_thread_pool(num_threads: usize, thread_pinning: bool) -> rayon::ThreadPool {
     let core_ids = if thread_pinning {
         match core_affinity::get_core_ids() {
@@ -35,153 +71,98 @@ pub fn new_thread_pool(num_threads: usize, thread_pinning: bool) -> rayon::Threa
         })
 }
 
+/// Where a plot directory physically lives, as far as we can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BusType {
+    Usb,
+    Nvme,
+    Sata,
+    Removable,
+    Network,
+    Unknown,
+}
+
+impl BusType {
+    pub fn label(self) -> &'static str {
+        match self {
+            BusType::Usb => "USB",
+            BusType::Nvme => "NVMe",
+            BusType::Sata => "SATA",
+            BusType::Removable => "removable",
+            BusType::Network => "network",
+            BusType::Unknown => "",
+        }
+    }
+}
+
 cfg_if! {
     if #[cfg(unix)] {
-        use std::process::Command;
+        use std::os::unix::fs::MetadataExt;
+        use std::path::Path;
 
+        /// Identify the device a path lives on.  Plots on the same device are
+        /// read by the same reader thread, so this must be stable and must
+        /// differ between physical drives.  `st_dev` gives us exactly that
+        /// without shelling out to `stat`.
         pub fn get_device_id(path: &str) -> String {
-            match Command::new("stat")
-                .arg(path)
-                .args(["-c", "%D"])
-                .output()
-            {
-                Ok(output) => {
-                    String::from_utf8(output.stdout)
-                        .unwrap_or_else(|e| {
-                            warn!("stat output not UTF-8 for {}: {}", path, e);
-                            "unknown".to_string()
-                        })
-                        .trim_end()
-                        .to_owned()
-                }
+            match std::fs::metadata(path) {
+                Ok(m) => format!("{:x}", m.dev()),
                 Err(e) => {
-                    warn!("Failed to execute 'stat -c %D' for {}: {}", path, e);
+                    warn!("failed to stat {}: {}", path, e);
                     "unknown".to_string()
                 }
             }
         }
 
-        // On unix, get the device id from 'df' command
-        fn get_device_id_unix(path: &str) -> String {
-            match Command::new("df").arg(path).output() {
-                Ok(output) => {
-                    let source = String::from_utf8(output.stdout)
-                        .unwrap_or_else(|e| {
-                            warn!("df output not UTF-8 for {}: {}", path, e);
-                            String::from("unknown")
-                        });
-                    let lines: Vec<&str> = source.split('\n').collect();
-                    if lines.len() > 1 {
-                        lines[1]
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("unknown")
-                            .to_string()
-                    } else {
-                        warn!("df output has unexpected format for {}", path);
-                        String::from("unknown")
-                    }
+        #[cfg(target_os = "linux")]
+        fn split_dev(dev: u64) -> (u64, u64) {
+            // glibc's makedev()/major()/minor() encoding.
+            let major = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff);
+            let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0xff);
+            (major, minor)
+        }
+
+        /// Classify the bus a path's block device hangs off, via sysfs.
+        /// Purely informational: it is logged next to the plot directory so an
+        /// operator can see at a glance which bays are USB.
+        pub fn get_bus_type(path: &str) -> BusType {
+            #[cfg(target_os = "linux")]
+            {
+                let dev = match std::fs::metadata(path) {
+                    Ok(m) => m.dev(),
+                    Err(_) => return BusType::Unknown,
+                };
+                let (major, minor) = split_dev(dev);
+                if major == 0 {
+                    // FUSE, NFS, overlay, tmpfs... not a block device.
+                    return BusType::Network;
                 }
-                Err(e) => {
-                    warn!("Failed to execute 'df' for {}: {}", path, e);
-                    String::from("unknown")
+                let sys = Path::new("/sys/dev/block").join(format!("{}:{}", major, minor));
+                match std::fs::canonicalize(&sys) {
+                    Ok(real) => bus_type_from_sysfs_path(&real.to_string_lossy()),
+                    Err(_) => BusType::Unknown,
                 }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = path;
+                BusType::Unknown
             }
         }
 
-        // On macos, use df and 'diskutil info <device>' to get the Device Block Size line
-        // and extract the size
-        fn get_sector_size_macos(path: &str) -> u64 {
-            let source = get_device_id_unix(path);
-            match Command::new("diskutil").arg("info").arg(&source).output() {
-                Ok(output) => {
-                    let source = String::from_utf8(output.stdout)
-                        .unwrap_or_else(|e| {
-                            warn!("diskutil output not UTF-8 for {}: {}", path, e);
-                            String::new()
-                        });
-                    let mut sector_size: u64 = 0;
-                    for line in source.lines() {
-                        if line.trim().starts_with("Device Block Size") {
-                            // e.g. in reverse: "Bytes 512 Size Block Device"
-                            if let Some(size_str) = line.rsplit(' ').nth(1) {
-                                sector_size = size_str.parse::<u64>().unwrap_or_else(|e| {
-                                    warn!("Failed to parse sector size '{}': {}", size_str, e);
-                                    0
-                                });
-                            }
-                        }
-                    }
-                    if sector_size == 0 {
-                        warn!("Unable to determine disk physical sector size from diskutil info for {}. Using default 4096", path);
-                        4096
-                    } else {
-                        sector_size
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to execute 'diskutil info' for {}: {}, using default sector size 4096", path, e);
-                    4096
-                }
-            }
-        }
-
-        // On unix, use df and lsblk to extract the device sector size
-        fn get_sector_size_unix(path: &str) -> u64 {
-            let source = get_device_id_unix(path);
-            let output = Command::new("lsblk")
-                .arg(&source)
-                .arg("-o")
-                .arg("PHY-SeC")
-                .output()
-                .map(|output| output.stdout)
-                .unwrap_or_default();
-
-            let sector_size = String::from_utf8(output)
-                .unwrap_or_else(|e| {
-                    warn!("lsblk output not UTF-8 for {}: {}, defaulting to 4096", path, e);
-                    String::from("4096")
-                });
-
-            let lines: Vec<&str> = sector_size.split('\n').collect();
-            let size_str = if lines.len() > 1 {
-                lines[1].trim()
+        #[cfg(target_os = "linux")]
+        pub fn bus_type_from_sysfs_path(real: &str) -> BusType {
+            if real.contains("/usb") {
+                BusType::Usb
+            } else if real.contains("/nvme") {
+                BusType::Nvme
+            } else if real.contains("/ata") {
+                BusType::Sata
+            } else if real.contains("/mmc") {
+                BusType::Removable
             } else {
-                warn!("Failed to determine sector size for {}, defaulting to 4096", path);
-                "4096"
-            };
-
-            size_str.parse::<u64>().unwrap_or_else(|e| {
-                warn!("Failed to parse sector size '{}' for {}: {}, defaulting to 4096", size_str, path, e);
-                4096
-            })
-        }
-
-        pub fn get_sector_size(path: &str) -> u64 {
-            if cfg!(target_os = "android") {
-                4096
-            } else if cfg!(target_os = "macos") {
-                get_sector_size_macos(path)
-            } else {
-                get_sector_size_unix(path)
+                BusType::Unknown
             }
-        }
-
-        pub fn get_bus_type(path: &str) -> String {
-            let source = get_device_id_unix(path);
-            if cfg!(target_os = "linux") {
-                if let Ok(output) = Command::new("lsblk")
-                    .arg(&source)
-                    .arg("-ndo")
-                    .arg("TRAN")
-                    .output()
-                {
-                    if let Ok(bus) = String::from_utf8(output.stdout) {
-                        return bus.lines().next().unwrap_or("").trim().to_lowercase();
-                    }
-                }
-            }
-            String::from("unknown")
         }
     } else {
         use winapi;
@@ -215,100 +196,38 @@ cfg_if! {
             String::from(v[0])
         }
 
-        pub fn get_sector_size(path: &str) -> u64 {
-            let path_encoded = Path::new(path);
-            let parent_path = match path_encoded.parent() {
-                Some(p) => match p.to_str() {
-                    Some(s) => s,
-                    None => {
-                        warn!("Failed to convert parent path to string for {}, using default sector size 4096", path);
-                        return 4096;
-                    }
-                },
-                None => {
-                    warn!("Failed to get parent path for {}, using default sector size 4096", path);
-                    return 4096;
-                }
-            };
-
-            let parent_path_encoded = match CString::new(parent_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to create CString from parent path for {}: {}, using default sector size 4096", path, e);
-                    return 4096;
-                }
-            };
-
-            let mut sectors_per_cluster  = 0u32;
-            let mut bytes_per_sector  = 0u32;
-            let mut number_of_free_cluster  = 0u32;
-            let mut total_number_of_cluster  = 0u32;
-
-            if unsafe {
-                winapi::um::fileapi::GetDiskFreeSpaceA(
-                    parent_path_encoded.as_ptr(),
-                    &mut sectors_per_cluster,
-                    &mut bytes_per_sector,
-                    &mut number_of_free_cluster,
-                    &mut total_number_of_cluster
-                )
-            } == 0  {
-                warn!("Failed to get disk free space for {}, using default sector size 4096", path);
-                return 4096;
-            };
-            u64::from(bytes_per_sector)
-        }
-
-        pub fn get_bus_type(path: &str) -> String {
+        pub fn get_bus_type(path: &str) -> BusType {
             let path_encoded = Path::new(path);
             let parent_path = if path_encoded.is_dir() {
                 path_encoded
             } else {
                 match path_encoded.parent() {
                     Some(p) => p,
-                    None => {
-                        warn!("Failed to get parent path for {}, returning unknown bus type", path);
-                        return String::from("unknown");
-                    }
+                    None => return BusType::Unknown,
                 }
             };
 
             let parent_str = match parent_path.to_str() {
                 Some(s) => s,
-                None => {
-                    warn!("Failed to convert parent path to string for {}, returning unknown bus type", path);
-                    return String::from("unknown");
-                }
+                None => return BusType::Unknown,
             };
 
             let parent_c = match CString::new(parent_str) {
                 Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to create CString from parent path for {}: {}, returning unknown bus type", path, e);
-                    return String::from("unknown");
-                }
+                Err(_) => return BusType::Unknown,
             };
 
             let drive_type = unsafe { winapi::um::fileapi::GetDriveTypeA(parent_c.as_ptr()) };
             match drive_type {
-                winapi::um::winbase::DRIVE_REMOVABLE => "usb",
-                winapi::um::winbase::DRIVE_FIXED => "fixed",
-                winapi::um::winbase::DRIVE_REMOTE => "remote",
-                winapi::um::winbase::DRIVE_CDROM => "cdrom",
-                winapi::um::winbase::DRIVE_RAMDISK => "ramdisk",
-                _ => "unknown",
+                winapi::um::winbase::DRIVE_REMOVABLE => BusType::Removable,
+                winapi::um::winbase::DRIVE_REMOTE => BusType::Network,
+                _ => BusType::Unknown,
             }
-            .to_string()
         }
 
         pub fn set_thread_ideal_processor(id: usize){
-            // Set core affinity for current thread.
-        unsafe {
-            SetThreadIdealProcessor(
-                GetCurrentThread(),
-                id as u32
-            );
-
+            unsafe {
+                SetThreadIdealProcessor(GetCurrentThread(), id as u32);
             }
         }
     }
@@ -317,22 +236,49 @@ cfg_if! {
 #[cfg(test)]
 mod test {
     use super::*;
-    //use std::env;
 
     #[test]
     fn test_get_device_id() {
         if cfg!(unix) {
-            assert_ne!("", get_device_id(&"Cargo.toml".to_string()));
+            let id = get_device_id("Cargo.toml");
+            assert_ne!("", id);
+            assert_ne!("unknown", id);
+            // Two files on the same filesystem share a device id.
+            assert_eq!(id, get_device_id("build.rs"));
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn test_get_sector_size() {
-        // this should be true for any platform where this test runs
-        // but it doesn't exercise all platform variants
-        // let cwd = env::current_dir().unwrap();
-        // let test_string = cwd.into_os_string().into_string().unwrap();
-        // info!("{}", test_string);
-        // assert_ne!(0, get_sector_size(&test_string));
+    fn test_bus_type_from_sysfs_path() {
+        assert_eq!(
+            bus_type_from_sysfs_path(
+                "/sys/devices/platform/axi/1000120000.pcie/1f00300000.usb/xhci-hcd.1/usb4/4-1/4-1:1.0/host0/target0:0:0/0:0:0:0/block/sda/sda1"
+            ),
+            BusType::Usb
+        );
+        assert_eq!(
+            bus_type_from_sysfs_path(
+                "/sys/devices/pci0000:00/0000:00:1d.0/0000:03:00.0/nvme/nvme0/nvme0n1/nvme0n1p2"
+            ),
+            BusType::Nvme
+        );
+        assert_eq!(
+            bus_type_from_sysfs_path("/sys/devices/pci0000:00/0000:00:17.0/ata1/host0/target0:0:0/0:0:0:0/block/sda/sda1"),
+            BusType::Sata
+        );
+        assert_eq!(
+            bus_type_from_sysfs_path("/sys/devices/virtual/block/dm-0"),
+            BusType::Unknown
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_split_dev() {
+        // 8:1 (sda1) as encoded by glibc.
+        assert_eq!(split_dev(0x801), (8, 1));
+        // 259:3 (nvme) uses the extended minor bits.
+        assert_eq!(split_dev((259u64 << 8) | 3), (259, 3));
     }
 }
