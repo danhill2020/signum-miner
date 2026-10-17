@@ -11,8 +11,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures_core::Stream;
 use futures_core::Future;
+use futures_core::Stream;
 use pin_project::pin_project;
 use tokio::time::{self, Duration, Instant, Sleep};
 
@@ -65,12 +65,18 @@ where
                             this.buffer.push(new_item);
                         } else {
                             this.buffer.push(delayed_item.item.clone());
-                            *this.delayed_item = Some(DelayedItem::new(new_item.clone(), *this.delay_duration));
-                            this.delay.as_mut().reset(Instant::now() + *this.delay_duration);
+                            *this.delayed_item =
+                                Some(DelayedItem::new(new_item.clone(), *this.delay_duration));
+                            this.delay
+                                .as_mut()
+                                .reset(Instant::now() + *this.delay_duration);
                         }
                     } else {
-                        *this.delayed_item = Some(DelayedItem::new(new_item.clone(), *this.delay_duration));
-                        this.delay.as_mut().reset(Instant::now() + *this.delay_duration);
+                        *this.delayed_item =
+                            Some(DelayedItem::new(new_item.clone(), *this.delay_duration));
+                        this.delay
+                            .as_mut()
+                            .reset(Instant::now() + *this.delay_duration);
                     }
                 }
                 None => break,

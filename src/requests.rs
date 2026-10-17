@@ -1,7 +1,7 @@
 use crate::com::api::{FetchError, MiningInfoResponse};
 use crate::com::client::{Client, ProxyDetails, SubmissionParameters};
 use crate::future::prio_retry::PrioRetry;
-use futures_util::stream::{StreamExt};
+use futures_util::stream::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -123,7 +123,9 @@ impl RequestHandler {
         });
     }
 
-    pub fn get_mining_info<'a>(&'a self) -> impl std::future::Future<Output = Result<MiningInfoResponse, FetchError>> + 'a {
+    pub fn get_mining_info<'a>(
+        &'a self,
+    ) -> impl std::future::Future<Output = Result<MiningInfoResponse, FetchError>> + 'a {
         self.client.get_mining_info()
     }
 
@@ -226,23 +228,23 @@ mod tests {
 
     #[test]
     fn test_submit_nonce() {
-    use url::Url; // sicherstellen, dass url::Url verwendet wird
-    let rt = Runtime::new().expect("can't create runtime");
-    let handle = rt.handle().clone();
+        use url::Url; // sicherstellen, dass url::Url verwendet wird
+        let rt = Runtime::new().expect("can't create runtime");
+        let handle = rt.handle().clone();
 
-    // erzwinge url::Url statt reqwest::Url
-    let base_url: Url = BASE_URL.parse().expect("invalid URL");
+        // erzwinge url::Url statt reqwest::Url
+        let base_url: Url = BASE_URL.parse().expect("invalid URL");
 
-    let request_handler = RequestHandler::new(
-        base_url,
-        HashMap::new(),
-        3,
-        12,
-        true,
-        HashMap::new(),
-        handle,
-    );
+        let request_handler = RequestHandler::new(
+            base_url,
+            HashMap::new(),
+            3,
+            12,
+            true,
+            HashMap::new(),
+            handle,
+        );
 
-    request_handler.submit_nonce(1337, 12, 111, 0, 7123, 1193, [0; 32]);
-}
+        request_handler.submit_nonce(1337, 12, 111, 0, 7123, 1193, [0; 32]);
+    }
 }

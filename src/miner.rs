@@ -294,7 +294,12 @@ fn scan_plots(
         global_capacity as f64 / 4.0 / 1024.0 / 1024.0
     );
 
-    (drive_id_to_plots, global_capacity * 64, scan_had_errors, had_empty_plot_dir)
+    (
+        drive_id_to_plots,
+        global_capacity * 64,
+        scan_had_errors,
+        had_empty_plot_dir,
+    )
 }
 
 fn should_apply_capacity_update(
@@ -610,7 +615,8 @@ impl Miner {
         };
         let old_size = reader.total_size;
 
-        if !should_apply_capacity_update(old_size, total_size, scan_had_errors, had_empty_plot_dir) {
+        if !should_apply_capacity_update(old_size, total_size, scan_had_errors, had_empty_plot_dir)
+        {
             if scan_had_errors {
                 warn!(
                     "capacity rescan had filesystem errors and would reduce capacity ({:.4} -> {:.4} TiB). Keeping previous capacity.",

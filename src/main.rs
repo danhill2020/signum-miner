@@ -110,7 +110,6 @@ fn print_simd_support() {
     }
 }
 
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let cmd = Command::new(env!("CARGO_PKG_NAME"))
@@ -152,12 +151,8 @@ async fn main() {
     };
     logger::init_logger(&cfg_loaded);
 
-    info!(
-        "{} v{}",
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION")
-    );
-    
+    info!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     print_simd_support();
 

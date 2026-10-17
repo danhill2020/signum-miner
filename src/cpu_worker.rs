@@ -129,9 +129,9 @@ pub fn hash(
         let mut offset: u64 = 0;
 
         let bs = buffer.get_buffer_for_writing();
-#[cfg(feature = "async_io")]
+        #[cfg(feature = "async_io")]
         let bs = bs.blocking_lock();
-#[cfg(not(feature = "async_io"))]
+        #[cfg(not(feature = "async_io"))]
         let bs = match bs.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -240,7 +240,6 @@ pub fn hash(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::poc_hashing::find_best_deadline_rust;
@@ -253,7 +252,8 @@ mod tests {
     #[test]
     fn test_deadline_hashing() {
         let gensig =
-            hex::decode("4a6f686e6e7946464d206861742064656e206772f6df74656e2050656e697321").unwrap();
+            hex::decode("4a6f686e6e7946464d206861742064656e206772f6df74656e2050656e697321")
+                .unwrap();
 
         let mut gensig_array = [0u8; 32];
         gensig_array.copy_from_slice(&gensig[..]);

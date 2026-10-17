@@ -1,16 +1,19 @@
 use crate::com::api::*;
-use reqwest::{Client as InnerClient, header::{HeaderMap, HeaderName}};
-#[cfg(feature = "async_io")]
-use tokio::sync::Mutex;
-#[cfg(not(feature = "async_io"))]
-use std::sync::Mutex;
+use hostname::get;
+use reqwest::{
+    header::{HeaderMap, HeaderName},
+    Client as InnerClient,
+};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(not(feature = "async_io"))]
+use std::sync::Mutex;
 use std::time::Duration;
+#[cfg(feature = "async_io")]
+use tokio::sync::Mutex;
 use url::form_urlencoded::byte_serialize;
 use url::Url;
-use hostname::get;
 
 /// A client for communicating with Pool/Proxy/Wallet.
 #[derive(Clone, Debug)]
@@ -116,7 +119,8 @@ impl Client {
             *secret_phrase = byte_serialize(secret_phrase.as_bytes()).collect();
         }
 
-        let headers = Client::submit_nonce_headers(proxy_details.clone(), total_size_gb, additional_headers);
+        let headers =
+            Client::submit_nonce_headers(proxy_details.clone(), total_size_gb, additional_headers);
 
         let client = InnerClient::builder()
             .timeout(Duration::from_millis(timeout))

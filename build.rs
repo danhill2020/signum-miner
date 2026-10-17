@@ -13,18 +13,32 @@ fn compile_windows_icon() {
         let res_path = format!("{}/icon.res", out_dir);
 
         // Compile .rc file into .res
-        let windres_cmd = if Command::new("x86_64-w64-mingw32-windres").arg("--version").status().is_ok() {
-            "x86_64-w64-mingw32-windres"  
-        } else if Command::new("i686-w64-mingw32-windres").arg("--version").status().is_ok() {
-            "i686-w64-mingw32-windres"   
+        let windres_cmd = if Command::new("x86_64-w64-mingw32-windres")
+            .arg("--version")
+            .status()
+            .is_ok()
+        {
+            "x86_64-w64-mingw32-windres"
+        } else if Command::new("i686-w64-mingw32-windres")
+            .arg("--version")
+            .status()
+            .is_ok()
+        {
+            "i686-w64-mingw32-windres"
         } else if Command::new("windres").arg("--version").status().is_ok() {
-            "windres"  
+            "windres"
         } else {
             println!("cargo:warning=Windres not found, skipping icon resource compilation.");
             return;
         };
         let status = std::process::Command::new(windres_cmd)
-            .args(["--input", rc_path, "--output", &res_path, "--output-format=coff"])
+            .args([
+                "--input",
+                rc_path,
+                "--output",
+                &res_path,
+                "--output-format=coff",
+            ])
             .status()
             .expect("failed to run windres");
 
@@ -70,9 +84,9 @@ fn main() {
         .compile("shabal");
 
     // **Detect which SIMD features are enabled**
-    let simd_sse2    = env::var("CARGO_FEATURE_SIMD_SSE2").is_ok();
-    let simd_avx     = env::var("CARGO_FEATURE_SIMD_AVX").is_ok();
-    let simd_avx2    = env::var("CARGO_FEATURE_SIMD_AVX2").is_ok();
+    let simd_sse2 = env::var("CARGO_FEATURE_SIMD_SSE2").is_ok();
+    let simd_avx = env::var("CARGO_FEATURE_SIMD_AVX").is_ok();
+    let simd_avx2 = env::var("CARGO_FEATURE_SIMD_AVX2").is_ok();
     let simd_avx512f = env::var("CARGO_FEATURE_SIMD_AVX512F").is_ok();
 
     // **Ensure that at most one SIMD variant is active** – if more than one is enabled, stop with an error.
@@ -142,7 +156,7 @@ fn main() {
                 .compile("shabal_avx512f");
         }
     }
-    // If the umbrella "simd" feature is enabled *without* any specific subfeature, 
+    // If the umbrella "simd" feature is enabled *without* any specific subfeature,
     // no SIMD variant will be compiled (simd_count == 0, so nothing to do here).
 
     // **Compile Neon variant (independently selectable)**

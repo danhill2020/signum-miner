@@ -10,11 +10,11 @@
 //! 3. We timeout after time = 10s
 //! 4. We fire our next request at time t = 13s
 
+use core::future::Future;
+use futures_core::stream::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use core::future::Future; 
-use futures_core::stream::Stream;
 use tokio::time::{sleep_until, Sleep};
 
 /// A stream representing notifications at a fixed interval *after* processing completes.
@@ -28,10 +28,7 @@ pub struct Interval {
 impl Interval {
     /// Create a new `Interval` that starts at `at` and yields every `duration` interval after processing.
     pub fn new(at: Instant, duration: Duration) -> Self {
-        assert!(
-            duration > Duration::ZERO,
-            "`duration` must be non-zero."
-        );
+        assert!(duration > Duration::ZERO, "`duration` must be non-zero.");
 
         let sleep = Box::pin(sleep_until(at.into()));
         Self { sleep, duration }
@@ -57,5 +54,4 @@ impl Stream for Interval {
 
         Poll::Ready(Some(now))
     }
-
 }

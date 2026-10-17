@@ -69,7 +69,6 @@ pub fn create_gpu_worker_task(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use self::core::Event;

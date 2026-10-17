@@ -9,11 +9,11 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Stdout;
 use std::sync::Arc;
-#[cfg(feature = "async_io")]
-use tokio::sync::Mutex;
 #[cfg(not(feature = "async_io"))]
 use std::sync::Mutex;
 use stopwatch::Stopwatch;
+#[cfg(feature = "async_io")]
+use tokio::sync::Mutex;
 
 pub struct BufferInfo {
     pub len: usize,
@@ -113,7 +113,10 @@ impl Reader {
                     gpu_signal: 1,
                 },
             }) {
-                error!("reader: failed to send 'round start' signal to GPU thread: {}", e);
+                error!(
+                    "reader: failed to send 'round start' signal to GPU thread: {}",
+                    e
+                );
             }
         }
 
@@ -157,9 +160,9 @@ impl Reader {
         for plots in self.drive_id_to_plots.values() {
             let plots = plots.clone();
             self.pool.spawn(move || {
-#[cfg(feature = "async_io")]
+                #[cfg(feature = "async_io")]
                 let mut p = plots[0].blocking_lock();
-#[cfg(not(feature = "async_io"))]
+                #[cfg(not(feature = "async_io"))]
                 let mut p = match plots[0].lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => {
@@ -289,20 +292,22 @@ impl Reader {
                             }
                         }
                         i => {
-                            if let Err(e) = tx_read_replies_gpu.as_ref().unwrap()[i - 1].send(ReadReply {
-                                buffer,
-                                info: BufferInfo {
-                                    len: bytes_read,
-                                    height,
-                                    block,
-                                    base_target,
-                                    gensig: gensig.clone(),
-                                    start_nonce,
-                                    finished,
-                                    account_id: p.meta.account_id,
-                                    gpu_signal: 0,
-                                },
-                            }) {
+                            if let Err(e) =
+                                tx_read_replies_gpu.as_ref().unwrap()[i - 1].send(ReadReply {
+                                    buffer,
+                                    info: BufferInfo {
+                                        len: bytes_read,
+                                        height,
+                                        block,
+                                        base_target,
+                                        gensig: gensig.clone(),
+                                        start_nonce,
+                                        finished,
+                                        account_id: p.meta.account_id,
+                                        gpu_signal: 0,
+                                    },
+                                })
+                            {
                                 error!("reader: failed to send read data to GPU thread: {} -> stopping", e);
                                 break 'outer;
                             }
@@ -323,7 +328,10 @@ impl Reader {
                             gpu_signal: 0,
                         },
                     }) {
-                        error!("reader: failed to send read data to CPU thread: {} -> stopping", e);
+                        error!(
+                            "reader: failed to send read data to CPU thread: {} -> stopping",
+                            e
+                        );
                         break 'outer;
                     }
 
@@ -331,7 +339,9 @@ impl Reader {
 
                     if let Some(pb) = &pb {
                         match pb.lock() {
-                            Ok(mut pb) => { pb.add(bytes_read as u64); },
+                            Ok(mut pb) => {
+                                pb.add(bytes_read as u64);
+                            }
                             Err(poisoned) => {
                                 error!("reader: progress bar mutex poisoned, recovering...");
                                 let mut pb = poisoned.into_inner();
@@ -348,20 +358,22 @@ impl Reader {
                     if finished {
                         #[cfg(feature = "opencl")]
                         for i in 0..tx_read_replies_gpu.as_ref().unwrap().len() {
-                            if let Err(e) = tx_read_replies_gpu.as_ref().unwrap()[i].send(ReadReply {
-                                buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
-                                info: BufferInfo {
-                                    len: 1,
-                                    height,
-                                    block,
-                                    base_target,
-                                    gensig: gensig.clone(),
-                                    start_nonce: 0,
-                                    finished: false,
-                                    account_id: 0,
-                                    gpu_signal: 2,
-                                },
-                            }) {
+                            if let Err(e) =
+                                tx_read_replies_gpu.as_ref().unwrap()[i].send(ReadReply {
+                                    buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
+                                    info: BufferInfo {
+                                        len: 1,
+                                        height,
+                                        block,
+                                        base_target,
+                                        gensig: gensig.clone(),
+                                        start_nonce: 0,
+                                        finished: false,
+                                        account_id: 0,
+                                        gpu_signal: 2,
+                                    },
+                                })
+                            {
                                 error!("reader: failed to send 'drive finished' signal to GPU thread: {}", e);
                             }
                         }
@@ -413,15 +425,14 @@ impl Reader {
                 let mut nonces_processed = 0u64;
                 let plot_count = plots.len();
                 'outer: for (i_p, p) in plots.iter().enumerate() {
-#[cfg(feature = "async_io")]
+                    #[cfg(feature = "async_io")]
                     let mut p = p.lock().await;
-#[cfg(not(feature = "async_io"))]
+                    #[cfg(not(feature = "async_io"))]
                     let mut p = p.lock().unwrap();
                     if let Err(e) = p.prepare_async(scoop).await {
                         error!(
                             "reader: error preparing {} for reading: {} -> skip one round",
-                            p.meta.name,
-                            e
+                            p.meta.name, e
                         );
                         continue 'outer;
                     }
@@ -431,22 +442,22 @@ impl Reader {
                             sw.restart();
                         }
                         let mut_bs = buffer.get_buffer_for_writing();
-#[cfg(feature = "async_io")]
+                        #[cfg(feature = "async_io")]
                         let mut bs = mut_bs.lock().await;
-#[cfg(not(feature = "async_io"))]
+                        #[cfg(not(feature = "async_io"))]
                         let mut bs = mut_bs.lock().unwrap();
-                        let (bytes_read, start_nonce, next_plot) = match p.read_async(&mut bs, scoop).await {
-                            Ok(x) => x,
-                            Err(e) => {
-                                error!(
-                                    "reader: error reading chunk from {}: {} -> skip one round",
-                                    p.meta.name,
-                                    e
-                                );
-                                buffer.unmap();
-                                (0, 0, true)
-                            }
-                        };
+                        let (bytes_read, start_nonce, next_plot) =
+                            match p.read_async(&mut bs, scoop).await {
+                                Ok(x) => x,
+                                Err(e) => {
+                                    error!(
+                                        "reader: error reading chunk from {}: {} -> skip one round",
+                                        p.meta.name, e
+                                    );
+                                    buffer.unmap();
+                                    (0, 0, true)
+                                }
+                            };
 
                         if rx_interupt.try_recv().is_ok() {
                             buffer.unmap();
@@ -479,20 +490,22 @@ impl Reader {
                                 }
                             }
                             i => {
-                                if let Err(e) = tx_read_replies_gpu.as_ref().unwrap()[i - 1].send(ReadReply {
-                                    buffer,
-                                    info: BufferInfo {
-                                        len: bytes_read,
-                                        height,
-                                        block,
-                                        base_target,
-                                        gensig: gensig.clone(),
-                                        start_nonce,
-                                        finished,
-                                        account_id: p.meta.account_id,
-                                        gpu_signal: 0,
-                                    },
-                                }) {
+                                if let Err(e) =
+                                    tx_read_replies_gpu.as_ref().unwrap()[i - 1].send(ReadReply {
+                                        buffer,
+                                        info: BufferInfo {
+                                            len: bytes_read,
+                                            height,
+                                            block,
+                                            base_target,
+                                            gensig: gensig.clone(),
+                                            start_nonce,
+                                            finished,
+                                            account_id: p.meta.account_id,
+                                            gpu_signal: 0,
+                                        },
+                                    })
+                                {
                                     error!("reader: failed to send read data to GPU thread (async): {} -> stopping", e);
                                     break 'outer;
                                 }
@@ -521,9 +534,9 @@ impl Reader {
 
                         match &pb {
                             Some(pb) => {
-#[cfg(feature = "async_io")]
+                                #[cfg(feature = "async_io")]
                                 let mut pb = pb.lock().await;
-#[cfg(not(feature = "async_io"))]
+                                #[cfg(not(feature = "async_io"))]
                                 let mut pb = pb.lock().unwrap();
                                 pb.add(bytes_read as u64);
                             }
@@ -537,20 +550,23 @@ impl Reader {
                         if finished {
                             #[cfg(feature = "opencl")]
                             for i in 0..tx_read_replies_gpu.as_ref().unwrap().len() {
-                                if let Err(e) = tx_read_replies_gpu.as_ref().unwrap()[i].send(ReadReply {
-                                    buffer: Box::new(CpuBuffer::new(0)) as Box<dyn Buffer + Send>,
-                                    info: BufferInfo {
-                                        len: 1,
-                                        height,
-                                        block,
-                                        base_target,
-                                        gensig: gensig.clone(),
-                                        start_nonce: 0,
-                                        finished: false,
-                                        account_id: 0,
-                                        gpu_signal: 2,
-                                    },
-                                }) {
+                                if let Err(e) =
+                                    tx_read_replies_gpu.as_ref().unwrap()[i].send(ReadReply {
+                                        buffer: Box::new(CpuBuffer::new(0))
+                                            as Box<dyn Buffer + Send>,
+                                        info: BufferInfo {
+                                            len: 1,
+                                            height,
+                                            block,
+                                            base_target,
+                                            gensig: gensig.clone(),
+                                            start_nonce: 0,
+                                            finished: false,
+                                            account_id: 0,
+                                            gpu_signal: 2,
+                                        },
+                                    })
+                                {
                                     error!("reader: failed to send 'drive finished' signal to GPU thread (async): {}", e);
                                 }
                             }
@@ -562,7 +578,9 @@ impl Reader {
                                 format!(
                                     "drive {} finished, speed={} MiB/s",
                                     drive,
-                                    nonces_processed * 1000 / (elapsed + 1) as u64 * 64 / 1024 / 1024,
+                                    nonces_processed * 1000 / (elapsed + 1) as u64 * 64
+                                        / 1024
+                                        / 1024,
                                 )
                             );
                         }
