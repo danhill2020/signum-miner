@@ -162,13 +162,18 @@ fn main() {
         }
     }
 
-    // Always compile the baseline (non-SIMD) Shabal implementation.
+    // Always compile the baseline (non-SIMD) Shabal implementation and the
+    // scalar nonce generator (the plotter's reference and fallback).
     let mut base_config = shared_config.clone();
     base_config
         .file("src/c/sph_shabal.c")
         .file("src/c/shabal.c")
         .file("src/c/common.c")
         .compile("shabal");
+    shared_config
+        .clone()
+        .file("src/c/noncegen.c")
+        .compile("noncegen_scalar");
 
     let mut requested_x86 = Vec::new();
     for (name, flag) in [
@@ -184,6 +189,37 @@ fn main() {
     let backend = select_backend(&target_arch, &requested_x86, feature("neon"));
     println!("cargo:rustc-cfg=simd_backend=\"{}\"", backend);
 
+    // The plotter picks its hashing width at run time on x86: the AVX2 and
+    // AVX-512 nonce generators are always compiled (each with its own
+    // instruction-set flags) and only called when the CPU supports them.
+    if target_arch == "x86" || target_arch == "x86_64" {
+        for (name, define, gnu_flag, msvc_flag, mshabal) in [
+            (
+                "noncegen_avx2",
+                "NONCEGEN_AVX2",
+                "-mavx2",
+                "/arch:AVX2",
+                "src/c/mshabal_256_avx2.c",
+            ),
+            (
+                "noncegen_avx512f",
+                "NONCEGEN_AVX512F",
+                "-mavx512f",
+                "/arch:AVX512",
+                "src/c/mshabal_512_avx512f.c",
+            ),
+        ] {
+            let mut extra = shared_config.clone();
+            extra.flag(if msvc { msvc_flag } else { gnu_flag });
+            extra
+                .file(mshabal)
+                .file("src/c/noncegen.c")
+                .define(define, None)
+                .define("NONCEGEN_NAME", Some(name))
+                .compile(name);
+        }
+    }
+
     let mut config = base_config.clone();
     match backend.as_str() {
         "sse2" => {
@@ -193,6 +229,8 @@ fn main() {
             config
                 .file("src/c/mshabal_128_sse2.c")
                 .file("src/c/shabal_sse2.c")
+                .file("src/c/noncegen.c")
+                .define("NONCEGEN_SSE2", None)
                 .compile("shabal_sse2");
         }
         "avx" => {
@@ -204,6 +242,8 @@ fn main() {
             config
                 .file("src/c/mshabal_128_avx.c")
                 .file("src/c/shabal_avx.c")
+                .file("src/c/noncegen.c")
+                .define("NONCEGEN_AVX", None)
                 .compile("shabal_avx");
         }
         "avx2" => {
@@ -215,6 +255,8 @@ fn main() {
             config
                 .file("src/c/mshabal_256_avx2.c")
                 .file("src/c/shabal_avx2.c")
+                .file("src/c/noncegen.c")
+                .define("NONCEGEN_AVX2", None)
                 .compile("shabal_avx2");
         }
         "avx512f" => {
@@ -226,6 +268,8 @@ fn main() {
             config
                 .file("src/c/mshabal_512_avx512f.c")
                 .file("src/c/shabal_avx512f.c")
+                .file("src/c/noncegen.c")
+                .define("NONCEGEN_AVX512F", None)
                 .compile("shabal_avx512f");
         }
         "neon" => {
@@ -235,6 +279,8 @@ fn main() {
             config
                 .file("src/c/mshabal_128_neon.c")
                 .file("src/c/shabal_neon.c")
+                .file("src/c/noncegen.c")
+                .define("NONCEGEN_NEON", None)
                 .compile("shabal_neon");
         }
         _ => {}

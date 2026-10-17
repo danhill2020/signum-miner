@@ -51,8 +51,9 @@ jobs:
       - name: plotter smoke test (CPU)
         run: |
           mkdir -p /tmp/plots
-          ./target/release/signum-plotter --id 10282355196851764065 --path /tmp/plots --nonces 8 --threads 2
+          ./target/release/signum-plotter --id 10282355196851764065 --path /tmp/plots --nonces 8 --threads 2 --mem 0.01
           cmp -n 2097144 /tmp/plots/10282355196851764065_0_8 test_data/10282355196851764065_0_8
+          ./target/release/signum-plotter --id 1 --path /tmp/plots --nonces 256 --bench
 
   gui-tests:
     name: GUI logic tests (python)
@@ -87,7 +88,7 @@ jobs:
         run: |
           ./target/release/signum-plotter --list-devices
           mkdir -p /tmp/gpu-plots
-          ./target/release/signum-plotter --id 10282355196851764065 --path /tmp/gpu-plots --nonces 8 --gpu 0:0
+          ./target/release/signum-plotter --id 10282355196851764065 --path /tmp/gpu-plots --nonces 8 --gpu 0:0 --batch 3 --mem 0.01
           cmp -n 2097144 /tmp/gpu-plots/10282355196851764065_0_8 test_data/10282355196851764065_0_8
 
   test-aarch64:

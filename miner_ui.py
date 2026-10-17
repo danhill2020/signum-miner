@@ -927,7 +927,7 @@ class MinerUI:
 
         form = ctk.CTkFrame(page, fg_color=SURFACE, corner_radius=12, border_width=1, border_color=BORDER)
         form.grid(row=1, column=0, sticky="ew")
-        form.grid_columnconfigure(1, weight=1)
+        form.grid_columnconfigure(1, weight=1, minsize=440)
         saved = self.settings.get("plotter", {})
 
         def row(r, label, widget, help_text=""):
@@ -955,7 +955,7 @@ class MinerUI:
         row(2, "Size (GB)", ctk.CTkEntry(form, textvariable=self.plot_size, width=140), "1 GB = 4096 nonces; one file per run")
 
         self.plot_start = tk.StringVar(value=saved.get("start", ""))
-        row(3, "Start nonce", ctk.CTkEntry(form, textvariable=self.plot_start, width=200), "empty = continue after this account's existing plots in the directory")
+        row(3, "Start nonce", ctk.CTkEntry(form, textvariable=self.plot_start, width=200), "empty = continue after the account's plots in the directory")
 
         dev_row = ctk.CTkFrame(form, fg_color="transparent")
         self.plot_device = tk.StringVar(value=saved.get("device", "CPU"))
@@ -967,8 +967,11 @@ class MinerUI:
         self.plot_threads = tk.StringVar(value=saved.get("threads", ""))
         row(5, "CPU threads", ctk.CTkEntry(form, textvariable=self.plot_threads, width=140), "empty = all cores (CPU plotting only)")
 
+        self.plot_mem = tk.StringVar(value=saved.get("mem_gb", ""))
+        row(6, "Memory (GB)", ctk.CTkEntry(form, textvariable=self.plot_mem, width=140), "write buffers; empty = a quarter of RAM; more = bigger writes")
+
         btns = ctk.CTkFrame(form, fg_color="transparent")
-        btns.grid(row=6, column=0, columnspan=3, sticky="ew", padx=14, pady=(8, 12))
+        btns.grid(row=7, column=0, columnspan=3, sticky="ew", padx=14, pady=(8, 12))
         self.plot_start_btn = ctk.CTkButton(btns, text="▶  Start plotting", height=38, font=(FONT, 13, "bold"), command=self.start_plotter)
         self.plot_start_btn.pack(side="left")
         self.plot_stop_btn = ctk.CTkButton(btns, text="■  Stop", height=38, fg_color=SURFACE_ALT, hover_color=ERROR, text_color=TEXT, state="disabled", command=self.stop_plotter)
@@ -1379,6 +1382,15 @@ class MinerUI:
         threads = self.plot_threads.get().strip()
         if threads.isdigit() and not device.startswith("GPU "):
             cmd += ["--threads", threads]
+        mem = self.plot_mem.get().strip()
+        if mem:
+            try:
+                if float(mem) <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror(APP_NAME, "Memory must be a positive number of GB (or empty).")
+                return None
+            cmd += ["--mem", mem]
         if bench:
             cmd.append("--bench")
         return cmd
@@ -1409,6 +1421,7 @@ class MinerUI:
             "start": self.plot_start.get(),
             "device": self.plot_device.get(),
             "threads": self.plot_threads.get(),
+            "mem_gb": self.plot_mem.get(),
         }
 
     def bench_plotter(self) -> None:
@@ -1589,6 +1602,7 @@ class MinerUI:
             "start": self.plot_start.get(),
             "device": self.plot_device.get(),
             "threads": self.plot_threads.get(),
+            "mem_gb": self.plot_mem.get(),
         }
         save_settings(self.settings)
 

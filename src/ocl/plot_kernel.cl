@@ -1,15 +1,26 @@
 /*
  * PoC2 nonce generation on the GPU.
  *
- * One work-item generates one nonce in a private slice of the global
- * `gendata` buffer (GEN_SIZE bytes each, laid out one after another):
+ * One work-item generates one nonce:
  *
  *   gendata[NONCE_SIZE..] = account_id (BE) || nonce (BE)
  *   for i = NONCE_SIZE down to 32 step 32:
  *       gendata[i-32..i] = shabal256(gendata[i .. i + min(GEN_SIZE - i, 4096)])
  *   final = shabal256(gendata[0..GEN_SIZE])
- *   gendata[k] ^= final[k % 32]           (k < NONCE_SIZE)
- *   PoC2: swap second hash of scoop s with second hash of scoop 4095-s
+ *   scoop s = (gendata[s*64 .. +32], gendata[(4095-s)*64 + 32 .. +32]) ^ final
+ *
+ * Memory layout is what makes this fast: the work buffer is interleaved by
+ * nonce, 32-bit word w of work-item g sits at gendata[w * n + g] (n = padded
+ * batch size).  Neighbouring work-items therefore read and write neighbouring
+ * words and every access of a wavefront is one coalesced transaction; a
+ * nonce-per-slice layout would touch a different cache line per work-item.
+ * Chaining 8192 hashes is ~34 MB of reads per nonce, so this is the
+ * difference between a memory-bound and a compute-bound kernel.
+ *
+ * `generate_nonces` runs the chain and stores the final hash;
+ * `finish_nonces` (one work-item per scoop and nonce) applies the XOR and the
+ * PoC2 swap and writes scoop-major output, `out[(s * count + g) * 64]`, which
+ * the host copies straight into its write chunk.
  *
  * Every hashed length is a multiple of 4 bytes, so the message is handled as
  * 32-bit words throughout and the 0x80 padding byte always starts a fresh
@@ -162,12 +173,13 @@ __constant static const sph_u32 C_init_256[] = {
 #define HASH_CAP         4096
 #define GEN_SIZE         (NONCE_SIZE + 16)
 #define GEN_WORDS        (GEN_SIZE / 4)
+#define NONCE_WORDS      (NONCE_SIZE / 4)
 
 /*
- * Shabal-256 of `len_words` 32-bit words starting at `msg` (global memory).
- * Writes 8 words to `out`.
+ * Shabal-256 of `len_words` 32-bit words, word k of the message at
+ * msg[k * stride].  Writes 8 words to `out`.
  */
-static void shabal256_words(__global const sph_u32* msg, uint len_words, sph_u32* out)
+static void shabal256_words(__global const sph_u32* msg, uint stride, uint len_words, sph_u32* out)
 {
     sph_u32
         A00 = A_init_256[0], A01 = A_init_256[1], A02 = A_init_256[2], A03 = A_init_256[3],
@@ -188,27 +200,28 @@ static void shabal256_words(__global const sph_u32* msg, uint len_words, sph_u32
 
     uint full_blocks = len_words / 16;
     uint rem = len_words % 16;
+    __global const sph_u32* p = msg;
+    size_t step = (size_t)stride * 16;
 
     for (uint b = 0; b < full_blocks; b++) {
-        __global const sph_u32* p = msg + b * 16;
-        M0 = p[0];  M1 = p[1];  M2 = p[2];  M3 = p[3];
-        M4 = p[4];  M5 = p[5];  M6 = p[6];  M7 = p[7];
-        M8 = p[8];  M9 = p[9];  MA = p[10]; MB = p[11];
-        MC = p[12]; MD = p[13]; ME = p[14]; MF = p[15];
+        M0 = p[0 * stride];  M1 = p[1 * stride];  M2 = p[2 * stride];  M3 = p[3 * stride];
+        M4 = p[4 * stride];  M5 = p[5 * stride];  M6 = p[6 * stride];  M7 = p[7 * stride];
+        M8 = p[8 * stride];  M9 = p[9 * stride];  MA = p[10 * stride]; MB = p[11 * stride];
+        MC = p[12 * stride]; MD = p[13 * stride]; ME = p[14 * stride]; MF = p[15 * stride];
         INPUT_BLOCK_ADD;
         XOR_W;
         APPLY_P;
         INPUT_BLOCK_SUB;
         SWAP_BC;
         INCR_W;
+        p += step;
     }
 
     /* Final block: the remaining words, then 0x80 and zero padding. */
     {
         sph_u32 w[16];
-        __global const sph_u32* p = msg + full_blocks * 16;
         for (uint k = 0; k < 16; k++) {
-            w[k] = (k < rem) ? p[k] : ((k == rem) ? 0x80U : 0U);
+            w[k] = (k < rem) ? p[k * stride] : ((k == rem) ? 0x80U : 0U);
         }
         M0 = w[0];  M1 = w[1];  M2 = w[2];  M3 = w[3];
         M4 = w[4];  M5 = w[5];  M6 = w[6];  M7 = w[7];
@@ -234,24 +247,26 @@ static inline uint bswap32(uint v)
 }
 
 /*
- * gendata: batch * GEN_SIZE bytes.  Work-item g produces nonce start_nonce + g
- * in gendata[g * GEN_SIZE ..].  After the kernel the first NONCE_SIZE bytes of
- * each slice hold the finished PoC2 nonce.
+ * gendata: GEN_WORDS * n words, interleaved (word w of work-item g at
+ * gendata[w * n + g]).  finals: 8 * n words, same interleaving.  Work-items
+ * >= count idle; n is the padded global size.
  */
-__kernel void generate_nonces(ulong account_id, ulong start_nonce, uint count, __global sph_u32* gendata)
+__kernel void generate_nonces(ulong account_id, ulong start_nonce, uint count, uint n,
+                              __global sph_u32* gendata, __global sph_u32* finals)
 {
     uint gid = get_global_id(0);
     if (gid >= count) {
         return;
     }
     ulong nonce = start_nonce + gid;
-    __global sph_u32* g = gendata + (ulong)gid * GEN_WORDS;
+    __global sph_u32* g = gendata + gid;
+    size_t sn = n;
 
     /* Seed: account id and nonce, big-endian, in the last 16 bytes. */
-    g[GEN_WORDS - 4] = bswap32((uint)(account_id >> 32));
-    g[GEN_WORDS - 3] = bswap32((uint)(account_id & 0xFFFFFFFFUL));
-    g[GEN_WORDS - 2] = bswap32((uint)(nonce >> 32));
-    g[GEN_WORDS - 1] = bswap32((uint)(nonce & 0xFFFFFFFFUL));
+    g[(GEN_WORDS - 4) * sn] = bswap32((uint)(account_id >> 32));
+    g[(GEN_WORDS - 3) * sn] = bswap32((uint)(account_id & 0xFFFFFFFFUL));
+    g[(GEN_WORDS - 2) * sn] = bswap32((uint)(nonce >> 32));
+    g[(GEN_WORDS - 1) * sn] = bswap32((uint)(nonce & 0xFFFFFFFFUL));
 
     sph_u32 h[8];
     for (uint i = NONCE_SIZE; i > 0; i -= HASH_SIZE) {
@@ -259,25 +274,40 @@ __kernel void generate_nonces(ulong account_id, ulong start_nonce, uint count, _
         if (len > HASH_CAP) {
             len = HASH_CAP;
         }
-        shabal256_words(g + i / 4, len / 4, h);
-        __global sph_u32* dst = g + (i - HASH_SIZE) / 4;
-        dst[0] = h[0]; dst[1] = h[1]; dst[2] = h[2]; dst[3] = h[3];
-        dst[4] = h[4]; dst[5] = h[5]; dst[6] = h[6]; dst[7] = h[7];
+        shabal256_words(g + (size_t)(i / 4) * sn, n, len / 4, h);
+        __global sph_u32* dst = g + (size_t)((i - HASH_SIZE) / 4) * sn;
+        dst[0 * sn] = h[0]; dst[1 * sn] = h[1]; dst[2 * sn] = h[2]; dst[3 * sn] = h[3];
+        dst[4 * sn] = h[4]; dst[5 * sn] = h[5]; dst[6 * sn] = h[6]; dst[7 * sn] = h[7];
     }
 
-    shabal256_words(g, GEN_WORDS, h);
-    for (uint k = 0; k < NONCE_SIZE / 4; k++) {
-        g[k] ^= h[k & 7];
+    shabal256_words(g, n, GEN_WORDS, h);
+    for (uint k = 0; k < 8; k++) {
+        finals[k * sn + gid] = h[k];
     }
+}
 
-    /* PoC2 shuffle. */
-    for (uint s = 0; s < SCOOPS_PER_NONCE / 2; s++) {
-        __global sph_u32* a = g + (s * SCOOP_SIZE + HASH_SIZE) / 4;
-        __global sph_u32* b = g + ((SCOOPS_PER_NONCE - 1 - s) * SCOOP_SIZE + HASH_SIZE) / 4;
-        for (uint k = 0; k < 8; k++) {
-            sph_u32 t = a[k];
-            a[k] = b[k];
-            b[k] = t;
-        }
+/*
+ * One work-item per (scoop, nonce); global size n * SCOOPS_PER_NONCE with the
+ * nonce index varying fastest so the reads stay coalesced.  Writes the
+ * finished scoop (final XOR, PoC2 swap) to out[(s * count + g) * 16 words].
+ */
+__kernel void finish_nonces(uint count, uint n, __global const sph_u32* gendata,
+                            __global const sph_u32* finals, __global sph_u32* out)
+{
+    size_t id = get_global_id(0);
+    uint g = (uint)(id % n);
+    uint s = (uint)(id / n);
+    if (g >= count || s >= SCOOPS_PER_NONCE) {
+        return;
+    }
+    size_t sn = n;
+    uint s2 = SCOOPS_PER_NONCE - 1 - s;
+    __global const sph_u32* h0 = gendata + (size_t)(s * 16) * sn + g;
+    __global const sph_u32* h1 = gendata + (size_t)(s2 * 16 + 8) * sn + g;
+    __global sph_u32* dst = out + ((size_t)s * count + g) * 16;
+    for (uint k = 0; k < 8; k++) {
+        sph_u32 f = finals[k * sn + g];
+        dst[k] = h0[k * sn] ^ f;
+        dst[8 + k] = h1[k * sn] ^ f;
     }
 }

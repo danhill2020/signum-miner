@@ -1,13 +1,20 @@
 //! The plotter: generates PoC2 plot files for an account on the CPU or, with
 //! the `opencl` feature, on a GPU.
+//!
+//! Pipeline: the generator fills a scoop-major *chunk* of `chunk` nonces
+//! (one or more generator batches) while the writer thread writes the
+//! previous chunk, so hashing and disk I/O overlap.  Two chunk buffers are
+//! allocated: memory use is `2 * chunk * 256 KiB`.
 
+pub mod cpu;
 pub mod poc2;
 pub mod writer;
 
 #[cfg(feature = "opencl")]
 pub mod gpu;
 
-use poc2::{GEN_SIZE, NONCE_SIZE};
+pub use cpu::CpuGenerator;
+use poc2::NONCE_SIZE;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -15,41 +22,23 @@ use std::thread;
 use std::time::{Duration, Instant};
 use writer::PlotWriter;
 
-/// Something that fills a nonce-major buffer with consecutive nonces.
+/// Something that produces consecutive nonces straight into a scoop-major
+/// chunk: scoop `s` of nonce index `n` lives at `(s * chunk_nonces + n) * 64`.
 pub trait NonceGenerator: Send {
     fn name(&self) -> String;
-    /// Distance in bytes between consecutive nonces in the buffers it fills.
-    fn stride(&self) -> usize;
-    /// Generate `count` nonces starting at `start_nonce` into `out`
-    /// (`count * stride()` bytes).
+    /// Most nonces a single `generate` call can produce; 0 means any number.
+    fn max_batch(&self) -> usize;
+    /// Generate `count` nonces starting at `start_nonce` as nonce indexes
+    /// `offset..offset + count` of `chunk` (which holds `chunk_nonces`).
     fn generate(
         &mut self,
         account_id: u64,
         start_nonce: u64,
         count: usize,
-        out: &mut [u8],
+        chunk: &mut [u8],
+        chunk_nonces: usize,
+        offset: usize,
     ) -> io::Result<()>;
-}
-
-pub struct CpuGenerator;
-
-impl NonceGenerator for CpuGenerator {
-    fn name(&self) -> String {
-        format!("CPU ({} threads)", rayon::current_num_threads())
-    }
-    fn stride(&self) -> usize {
-        NONCE_SIZE
-    }
-    fn generate(
-        &mut self,
-        account_id: u64,
-        start_nonce: u64,
-        count: usize,
-        out: &mut [u8],
-    ) -> io::Result<()> {
-        poc2::generate_batch(account_id, start_nonce, &mut out[..count * NONCE_SIZE]);
-        Ok(())
-    }
 }
 
 /// What to plot.
@@ -59,8 +48,8 @@ pub struct PlotJob {
     pub start_nonce: u64,
     pub nonces: u64,
     pub directory: PathBuf,
-    /// Nonces generated per batch.
-    pub batch: usize,
+    /// Nonces per chunk (write unit); two chunk buffers are kept in memory.
+    pub chunk: usize,
     /// Generate only, do not write (benchmark).
     pub dry_run: bool,
 }
@@ -71,6 +60,13 @@ impl PlotJob {
     }
     pub fn path(&self) -> PathBuf {
         self.directory.join(self.file_name())
+    }
+    pub fn chunk_nonces(&self) -> usize {
+        (self.chunk.max(1) as u64).min(self.nonces.max(1)) as usize
+    }
+    /// Bytes of RAM the two chunk buffers take.
+    pub fn buffer_bytes(&self) -> u64 {
+        2 * self.chunk_nonces() as u64 * NONCE_SIZE as u64
     }
 }
 
@@ -102,35 +98,41 @@ impl Progress {
     }
 }
 
-/// Run a plot job: generation and writing overlap through a two-buffer
-/// pipeline (generate batch N+1 while batch N is written).
+/// Run a plot job.  `on_progress` is called after every generator batch with
+/// the number of nonces generated so far.
 pub fn run(
     job: &PlotJob,
     generator: &mut dyn NonceGenerator,
     mut on_progress: impl FnMut(Progress),
 ) -> io::Result<PathBuf> {
-    let stride = generator.stride();
-    let batch = job.batch.max(1);
-    let buffer_len = batch * stride.max(GEN_SIZE);
+    let chunk_nonces = job.chunk_nonces();
+    let max_batch = generator.max_batch();
+    let batch = if max_batch == 0 {
+        chunk_nonces
+    } else {
+        max_batch.min(chunk_nonces)
+    };
     let path = job.path();
     let started = Instant::now();
 
     let mut writer = if job.dry_run {
         None
     } else {
-        Some(PlotWriter::create(&path, job.nonces, batch)?)
+        Some(PlotWriter::create(&path, job.nonces)?)
     };
 
-    // Writer thread: receives (first, count, buffer), writes, hands the buffer back.
+    // Writer thread: receives (first, count, chunk), writes, hands the buffer back.
     let (tx_full, rx_full) = mpsc::sync_channel::<(u64, usize, Vec<u8>)>(1);
     let (tx_empty, rx_empty) = mpsc::channel::<Vec<u8>>();
     for _ in 0..2 {
-        tx_empty.send(vec![0u8; buffer_len]).expect("channel open");
+        tx_empty
+            .send(vec![0u8; chunk_nonces * NONCE_SIZE])
+            .expect("channel open");
     }
     let writer_thread = thread::spawn(move || -> io::Result<()> {
         for (first, count, buf) in rx_full {
             if let Some(w) = writer.as_mut() {
-                w.write_batch(first, &buf, count, stride)?;
+                w.write_chunk(first, &buf, count)?;
             }
             if tx_empty.send(buf).is_err() {
                 break;
@@ -144,30 +146,39 @@ pub fn run(
 
     let mut done = 0u64;
     let mut result = Ok(());
-    while done < job.nonces {
-        let count = batch.min((job.nonces - done) as usize);
+    'chunks: while done < job.nonces {
+        let count = chunk_nonces.min((job.nonces - done) as usize);
         let Ok(mut buf) = rx_empty.recv() else {
             break; // writer died; its error is collected below
         };
-        if let Err(e) = generator.generate(job.account_id, job.start_nonce + done, count, &mut buf)
-        {
-            result = Err(e);
-            break;
+        let mut offset = 0usize;
+        while offset < count {
+            let n = batch.min(count - offset);
+            if let Err(e) = generator.generate(
+                job.account_id,
+                job.start_nonce + done + offset as u64,
+                n,
+                &mut buf,
+                count,
+                offset,
+            ) {
+                result = Err(e);
+                break 'chunks;
+            }
+            offset += n;
+            let elapsed = started.elapsed();
+            let generated = done + offset as u64;
+            on_progress(Progress {
+                done: generated,
+                total: job.nonces,
+                nonces_per_minute: generated as f64 / elapsed.as_secs_f64().max(1e-9) * 60.0,
+                elapsed,
+            });
         }
-        if tx_full
-            .send((job.start_nonce + done - job.start_nonce, count, buf))
-            .is_err()
-        {
+        if tx_full.send((done, count, buf)).is_err() {
             break;
         }
         done += count as u64;
-        let elapsed = started.elapsed();
-        on_progress(Progress {
-            done,
-            total: job.nonces,
-            nonces_per_minute: done as f64 / elapsed.as_secs_f64().max(1e-9) * 60.0,
-            elapsed,
-        });
     }
     drop(tx_full);
     let writer_result = writer_thread
@@ -176,6 +187,34 @@ pub fn run(
     result?;
     writer_result?;
     Ok(path)
+}
+
+/// Chunk size (nonces) for a memory budget of `bytes` across both buffers.
+pub fn chunk_for_memory(bytes: u64) -> usize {
+    (bytes / 2 / NONCE_SIZE as u64).clamp(16, 1 << 20) as usize
+}
+
+/// Default chunk: a quarter of the machine's RAM for the two buffers, at
+/// most 8192 nonces (2 GiB per buffer) and at least 256 (64 MiB per buffer).
+pub fn default_chunk_nonces() -> usize {
+    let ram = total_memory().unwrap_or(4 << 30);
+    chunk_for_memory(ram / 4).clamp(256, 8192)
+}
+
+#[cfg(unix)]
+fn total_memory() -> Option<u64> {
+    // SAFETY: plain sysconf queries.
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if pages <= 0 || page <= 0 {
+        return None;
+    }
+    Some(pages as u64 * page as u64)
+}
+
+#[cfg(not(unix))]
+fn total_memory() -> Option<u64> {
+    None
 }
 
 /// Highest end nonce of existing plots for `account_id` in `dir`, so a new
@@ -233,8 +272,30 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Chunk of 3 with a generator limited to 2 per batch: exercises
+    /// sub-batching, a partial last chunk and the scoop-major writes.
     #[test]
     fn run_pipeline_writes_a_correct_plot() {
+        struct Limited(CpuGenerator);
+        impl NonceGenerator for Limited {
+            fn name(&self) -> String {
+                self.0.name()
+            }
+            fn max_batch(&self) -> usize {
+                2
+            }
+            fn generate(
+                &mut self,
+                a: u64,
+                s: u64,
+                c: usize,
+                chunk: &mut [u8],
+                cn: usize,
+                o: usize,
+            ) -> io::Result<()> {
+                self.0.generate(a, s, c, chunk, cn, o)
+            }
+        }
         let dir = std::env::temp_dir().join(format!("signum-plotter-r-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let job = PlotJob {
@@ -242,12 +303,15 @@ mod tests {
             start_nonce: 0,
             nonces: 8,
             directory: dir.clone(),
-            batch: 3,
+            chunk: 3,
             dry_run: false,
         };
         let mut progress = Vec::new();
-        let path = run(&job, &mut CpuGenerator, |p| progress.push(p.done)).unwrap();
-        assert_eq!(progress, vec![3, 6, 8]);
+        let path = run(&job, &mut Limited(CpuGenerator::new()), |p| {
+            progress.push(p.done)
+        })
+        .unwrap();
+        assert_eq!(progress, vec![2, 3, 5, 6, 8]);
         let ours = std::fs::read(&path).unwrap();
         let reference = std::fs::read(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -260,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_math() {
+    fn progress_math_and_chunk_sizing() {
         let p = Progress {
             done: 50,
             total: 200,
@@ -271,5 +335,9 @@ mod tests {
         assert_eq!(p.eta().unwrap().as_secs(), 90);
         assert_eq!(format_duration(Duration::from_secs(3725)), "1h 02m");
         assert_eq!(format_duration(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(chunk_for_memory(2 << 30), 4096);
+        assert_eq!(chunk_for_memory(1), 16);
+        let d = default_chunk_nonces();
+        assert!((256..=8192).contains(&d));
     }
 }

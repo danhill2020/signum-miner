@@ -96,7 +96,9 @@ pub fn generate_nonce(account_id: u64, nonce: u64) -> Vec<u8> {
 }
 
 /// Fill `batch` (nonce-major, `count * NONCE_SIZE` bytes) with nonces
-/// `start_nonce..start_nonce + count` using all available cores.
+/// `start_nonce..start_nonce + count` using all available cores.  Test
+/// oracle: slow, byte-level, independent of the SIMD and GPU paths.
+#[allow(dead_code)]
 pub fn generate_batch(account_id: u64, start_nonce: u64, batch: &mut [u8]) {
     use rayon::prelude::*;
     batch.par_chunks_mut(NONCE_SIZE).enumerate().for_each_init(
@@ -105,6 +107,32 @@ pub fn generate_batch(account_id: u64, start_nonce: u64, batch: &mut [u8]) {
             generate_nonce_into(account_id, start_nonce + i as u64, out, scratch);
         },
     );
+}
+
+/// Reference for the fast generators: a scoop-major chunk of `chunk_nonces`
+/// nonces (scoop `s` of nonce index `n` at `(s * chunk_nonces + n) * 64`)
+/// with nonces `start_nonce..+count` placed at indexes `offset..`, and zeros
+/// in every other slot.
+#[allow(dead_code)]
+pub fn scoop_major_reference(
+    account_id: u64,
+    start_nonce: u64,
+    count: usize,
+    chunk_nonces: usize,
+    offset: usize,
+) -> Vec<u8> {
+    assert!(offset + count <= chunk_nonces);
+    let mut nonces = vec![0u8; count * NONCE_SIZE];
+    generate_batch(account_id, start_nonce, &mut nonces);
+    let mut chunk = vec![0u8; chunk_nonces * NONCE_SIZE];
+    for (n, nonce) in nonces.chunks(NONCE_SIZE).enumerate() {
+        for s in 0..SCOOPS_PER_NONCE {
+            let dst = (s * chunk_nonces + offset + n) * SCOOP_SIZE;
+            chunk[dst..dst + SCOOP_SIZE]
+                .copy_from_slice(&nonce[s * SCOOP_SIZE..(s + 1) * SCOOP_SIZE]);
+        }
+    }
+    chunk
 }
 
 #[cfg(test)]

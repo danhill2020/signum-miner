@@ -251,6 +251,41 @@ class NewParsingTests(unittest.TestCase):
                 else:
                     os.environ["XDG_CONFIG_HOME"] = old
 
+    def test_plotter_command_builder(self):
+        """The command line the GUI builds for signum-plotter (no window needed)."""
+        import os
+        import tempfile
+        import types
+
+        class Var:
+            def __init__(self, v):
+                self.v = v
+
+            def get(self):
+                return self.v
+
+        plot_dir = tempfile.mkdtemp()
+        app = types.SimpleNamespace(
+            plotter_binary=Path("/opt/signum-plotter"),
+            plot_account=Var("1234567890123456789"),
+            plot_dir=Var(plot_dir),
+            plot_size=Var("0.5"),
+            plot_start=Var("4096"),
+            plot_device=Var("GPU 0:1  Some GPU (32 compute units, 8.0 GiB)"),
+            plot_threads=Var("3"),
+            plot_mem=Var("2"),
+        )
+        cmd = miner_ui.MinerUI._plotter_command(app, bench=True)
+        self.assertEqual(
+            cmd,
+            ["/opt/signum-plotter", "--id", "1234567890123456789", "--path", plot_dir, "--nonces", "2048", "--start-nonce", "4096", "--gpu", "0:1", "--mem", "2", "--bench"],
+        )
+        app.plot_device = Var("CPU")
+        app.plot_mem = Var("")
+        cmd = miner_ui.MinerUI._plotter_command(app, bench=False)
+        self.assertEqual(cmd[-4:], ["--start-nonce", "4096", "--threads", "3"])
+        os.rmdir(plot_dir)
+
     def test_find_binary_by_name(self):
         import tempfile
 
