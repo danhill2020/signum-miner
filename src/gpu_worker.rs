@@ -72,7 +72,6 @@ mod tests {
     use self::core::Event;
     use crate::ocl::gpu_hash;
     use crate::ocl::GpuContext;
-    use hex;
     use ocl_core as core;
     use std::sync::Arc;
 
