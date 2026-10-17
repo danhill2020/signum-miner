@@ -198,16 +198,17 @@ fn main() {
     };
     if !m.get_flag("exact") && !m.get_flag("bench") {
         let rounded = nonces / NONCES_PER_BLOCK * NONCES_PER_BLOCK;
-        if rounded != nonces {
+        // Plots smaller than one block (test plots) are kept as they are.
+        if rounded != nonces && rounded > 0 {
             eprintln!(
                 "rounding {} nonces down to {} (a multiple of {} keeps every scoop region 4 KiB aligned; --exact to keep it)",
                 nonces, rounded, NONCES_PER_BLOCK
             );
+            nonces = rounded;
         }
-        nonces = rounded;
     }
     if nonces == 0 {
-        fail("the plot needs at least one nonce (64 without --exact)");
+        fail("the plot needs at least one nonce");
     }
     let start_nonce =
         parse_u64(&m, "start").unwrap_or_else(|| next_free_nonce(&directory, account_id));
