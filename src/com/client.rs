@@ -59,6 +59,12 @@ impl PartialOrd for SubmissionParameters {
     }
 }
 
+impl crate::future::prio_retry::RetryItem for SubmissionParameters {
+    fn is_stale_after(&self, last: &Self) -> bool {
+        self.block < last.block
+    }
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub enum ProxyDetails {
     Enabled,

@@ -5,7 +5,9 @@
 //! * An item equal to the last one yielded is a retry (the caller re-enqueues
 //!   a submission after a transient failure).  It is yielded again after an
 //!   exponential backoff, and given up after [`MAX_RETRIES`].
-//! * An item older than the last one yielded is stale and dropped.
+//! * An item for an older block than the last one yielded is stale and
+//!   dropped.  Items for the same block are all sent: with several accounts
+//!   each has its own best deadline, and none of them is "worse".
 //!
 //! The ordering is `S::Item: Ord`, see `SubmissionParameters`.
 
@@ -24,11 +26,18 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// Retries of one submission before it is dropped.
 const MAX_RETRIES: u32 = 12;
 
+/// What the retry queue needs to know about an item besides equality.
+pub trait RetryItem: Ord + Clone + Eq {
+    /// True when `self` belongs to an older round than `last` and sending it
+    /// would be pointless.
+    fn is_stale_after(&self, last: &Self) -> bool;
+}
+
 #[pin_project]
 pub struct PrioRetry<S>
 where
     S: Stream,
-    S::Item: Ord + Clone + Eq,
+    S::Item: RetryItem,
 {
     #[pin]
     stream: S,
@@ -46,7 +55,7 @@ where
 impl<S> PrioRetry<S>
 where
     S: Stream,
-    S::Item: Ord + Clone + Eq,
+    S::Item: RetryItem,
 {
     pub fn new(stream: S, base_delay: Duration) -> Self {
         Self {
@@ -64,7 +73,7 @@ where
 impl<S> Stream for PrioRetry<S>
 where
     S: Stream + Unpin,
-    S::Item: Ord + Clone + Eq + Unpin,
+    S::Item: RetryItem + Unpin,
 {
     type Item = S::Item;
 
@@ -93,17 +102,31 @@ where
                             *this.pending = Some(item);
                             continue;
                         }
-                        Some(last) if item < *last => {
-                            // Older block or a worse deadline than one already sent.
+                        Some(last) if item.is_stale_after(last) => {
+                            // Belongs to a block that is already over.
                             debug!("dropping stale submission");
                             continue;
                         }
                         _ => {}
                     }
-                    // New and better: send right away and forget any pending retry.
-                    *this.pending = None;
+                    // New: send right away.  A pending retry of an older item
+                    // is forgotten when a newer round starts.
+                    if this
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.is_stale_after(&item))
+                    {
+                        *this.pending = None;
+                    }
                     *this.retries = 0;
-                    *this.last_yielded = Some(item.clone());
+                    // Keep the newest block's best item as the reference.
+                    let replace = match this.last_yielded.as_ref() {
+                        None => true,
+                        Some(last) => last.is_stale_after(&item) || *last < item,
+                    };
+                    if replace {
+                        *this.last_yielded = Some(item.clone());
+                    }
                     return Poll::Ready(Some(item));
                 }
                 Poll::Ready(None) => {
@@ -135,6 +158,12 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
     struct Item(u64, u64);
 
+    impl RetryItem for Item {
+        fn is_stale_after(&self, last: &Self) -> bool {
+            self.0 < last.0
+        }
+    }
+
     type TestStream = Pin<Box<PrioRetry<UnboundedReceiverStream<Item>>>>;
 
     fn setup() -> (mpsc::UnboundedSender<Item>, TestStream) {
@@ -164,13 +193,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_items_are_dropped() {
+    async fn stale_items_are_dropped_but_same_block_items_are_sent() {
         let (tx, mut stream) = setup();
         tx.send(Item(5, 10)).unwrap();
         assert_eq!(next_within(&mut stream, 20).await, Some(Item(5, 10)));
-        tx.send(Item(4, 99)).unwrap(); // older block
-        tx.send(Item(5, 3)).unwrap(); // worse deadline
+        tx.send(Item(4, 99)).unwrap(); // older block: dropped
+        tx.send(Item(5, 3)).unwrap(); // same block, e.g. another account: sent
+        assert_eq!(next_within(&mut stream, 100).await, Some(Item(5, 3)));
         assert_eq!(next_within(&mut stream, 100).await, None);
+        // The best item of the block stays the reference for staleness.
+        tx.send(Item(5, 10)).unwrap(); // retry of the earlier one
+        let t = Instant::now();
+        assert_eq!(next_within(&mut stream, 500).await, Some(Item(5, 10)));
+        assert!(t.elapsed() >= Duration::from_millis(45));
     }
 
     #[tokio::test]
