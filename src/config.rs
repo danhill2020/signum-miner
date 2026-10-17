@@ -123,6 +123,12 @@ pub struct Cfg {
     #[serde(default = "default_submit_only_best")]
     pub submit_only_best: bool,
 
+    /// With `submit_only_best`, a deadline at or below this many seconds is
+    /// submitted as soon as it is found instead of at the end of the round,
+    /// so it can still forge the block.  0 disables early submission.
+    #[serde(default = "default_early_submit_deadline")]
+    pub early_submit_deadline: u64,
+
     pub benchmark_only: Option<Benchmark>,
 }
 
@@ -164,6 +170,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "show_progress",
     "show_drive_stats",
     "submit_only_best",
+    "early_submit_deadline",
     "benchmark_only",
 ];
 
@@ -342,6 +349,10 @@ fn default_show_drive_stats() -> bool {
 
 fn default_submit_only_best() -> bool {
     true
+}
+
+fn default_early_submit_deadline() -> u64 {
+    600
 }
 
 /// Top-level keys present in the YAML that the miner does not know about.

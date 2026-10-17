@@ -116,6 +116,10 @@ Settings worth knowing:
   is complete rather than every improvement as it is found. If the next block
   arrives before the round is complete, the best deadline found so far is
   submitted anyway.
+- `early_submit_deadline` (default 600 s): with `submit_only_best`, a deadline
+  this short (or shorter than about twice the previous round time) is sent the
+  moment it is found, because waiting for the end of the round could let it
+  expire. The best deadline is still sent at the end of the round.
 - `show_progress`: the progress bar is only drawn on an interactive terminal; under
   systemd or with output redirected to a file it is switched off automatically.
 
@@ -162,7 +166,7 @@ cpu_threads: 0              # all 4 cores hash
 cpu_worker_task_count: 4
 io_buffer_size: 16777216    # 16 MiB per read keeps USB queues full
 hdd_use_direct_io: true     # no page-cache churn on 4-8 GB of RAM
-hdd_wakeup_after: 240       # keep the bays spinning between blocks
+hdd_wakeup_after: 120       # keep the bays spinning between blocks
 show_progress: false        # headless
 logfile_log_level: off      # journald captures stdout
 ```
@@ -174,9 +178,14 @@ Notes:
 - Format drives as ext4 or exFAT. NTFS via `ntfs-3g` works but only with
   buffered reads, which the miner falls back to automatically.
 - Mount the bays through `/etc/fstab` with stable identifiers (`UUID=` or
-  `LABEL=`) so `/mnt/bayN` always points at the same disk. The included
-  [`contrib/signum-miner.service`](./contrib/signum-miner.service) shows how to
-  make systemd wait for those mounts and restart the miner if it ever stops.
+  `LABEL=`) so `/mnt/bayN` always points at the same disk, and add
+  `nofail,x-systemd.automount` to the options so a bay that resets or is
+  re-plugged is mounted again the next time the miner touches it, without a
+  reboot or a restart:
+  `UUID=... /mnt/bay1 ext4 defaults,noatime,nofail,x-systemd.automount 0 2`.
+  The included [`contrib/signum-miner.service`](./contrib/signum-miner.service)
+  shows how to make systemd wait for those mounts and restart the miner if it
+  ever stops.
 - Many enclosures have their own idle spin-down timer; `hdd_wakeup_after`
   issues a real read (not just a seek) so they stay awake. If an enclosure still
   sleeps, lower the value or disable its timer with `hdparm -B 255` /
@@ -203,7 +212,13 @@ likelihood:
 2. **Drives disappearing.** A USB reset or a late mount used to drop the
    bay from the scan; now it stays in the capacity for `plot_missing_grace`
    and is retried every round. The 5-minute disk health report shows which
-   drive is producing read errors.
+   drive is producing read errors, how long each drive took for its last
+   round and which one was slowest: the round cannot finish before the
+   slowest bay does, so that is the one to look at.
+4. **Good deadlines arriving late.** With `submit_only_best` the best
+   deadline used to be sent only after the whole farm was scanned; a
+   deadline shorter than the scan had already expired by then. Short
+   deadlines are now sent immediately (`early_submit_deadline`).
 3. **Plots skipped or rejected.** Fixed in 2.1.0 (wrong nonce for every
    scoop but 0, direct I/O alignment, rounds that never completed). A plot
    the miner cannot load is logged at start-up with the reason.

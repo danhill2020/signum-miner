@@ -42,6 +42,20 @@
 
 ### Added (capacity stability)
 
+- `early_submit_deadline` (default 600 s): with `submit_only_best`, a
+  deadline short enough to expire before the round ends is submitted as soon
+  as it is found; the best is still sent at round end, without repeating an
+  already-sent nonce.
+- A pool reporting a target deadline of 0 is treated as "no limit" instead
+  of "never submit".
+- Readers check for a new block before taking a buffer, so a new block no
+  longer costs one extra chunk read per drive.
+- The disk health report shows each drive's last round time and speed and
+  names the slowest drive; the metrics report shows the longest round and
+  how many rounds were interrupted by the next block.
+- Start-up warnings when `hdd_reader_thread_count` or the number of read
+  buffers is lower than the number of drives.
+
 - `plot_missing_grace` (default 1 h): plots that a rescan cannot find keep
   their place in the capacity and are retried every round until the grace
   period expires. This replaces the previous "debounce" heuristics and stops

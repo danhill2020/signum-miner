@@ -14,7 +14,8 @@ hdd_use_direct_io: true               # default true; falls back to buffered rea
                                       # when the filesystem refuses O_DIRECT (e.g. ntfs-3g)
 hdd_wakeup_after: 240                 # default 240s; 0 disables. Reads one block from every
                                       # drive when no block arrived for this long, so
-                                      # external USB bays do not spin down
+                                      # external USB bays do not spin down (use 60-120 for
+                                      # enclosures with their own short idle timer)
 
 cpu_threads: 0                        # default 0 (=auto: number of logical cpu cores)
 cpu_worker_task_count: 4              # default 4 (0=GPU only)
@@ -44,6 +45,9 @@ plot_missing_grace: 3600              # default 3600s; a plot that vanished (USB
 timeout: 5000                         # default 5000ms
 send_proxy_details: false              # default false
 submit_only_best: true                # default true
+early_submit_deadline: 600            # default 600s; with submit_only_best, a deadline this
+                                      # short is sent immediately (it could expire before the
+                                      # round ends), the best is still sent at round end
 #additional_headers:                  # add/overwrite html header
 #  "AccountKey" : "1234567890"
 

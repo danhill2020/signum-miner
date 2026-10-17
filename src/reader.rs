@@ -350,10 +350,24 @@ fn read_drive(ctx: ReadTaskContext) {
         let last_plot = i_p + 1 == plot_count;
 
         loop {
+            // Stop before taking a buffer: when a new block has arrived there
+            // is no point in reading (and hashing) another chunk.
+            if ctx.rx_interrupt.try_recv().is_ok() {
+                interrupted = true;
+                break 'outer;
+            }
             let Ok(mut buffer) = ctx.rx_empty_buffers.recv() else {
                 // Buffer pool is gone: the miner is shutting down.
                 break 'outer;
             };
+            if ctx.rx_interrupt.try_recv().is_ok() {
+                buffer.unmap();
+                if let Err(e) = ctx.tx_empty_buffers.send(buffer) {
+                    error!("reader: failed to return buffer to pool: {}", e);
+                }
+                interrupted = true;
+                break 'outer;
+            }
 
             let (bytes_read, start_nonce, next_plot) = {
                 let bs = buffer.get_buffer_for_writing();
@@ -415,8 +429,11 @@ fn read_drive(ctx: ReadTaskContext) {
             if finished {
                 #[cfg(feature = "opencl")]
                 signal_gpu_drive_finished(&ctx);
+                let elapsed_ms = started.elapsed().as_millis().max(1) as u64;
+                write_or_recover(&ctx.disk_health)
+                    .get_or_create(&ctx.drive)
+                    .record_round(elapsed_ms, nonces_processed * 64);
                 if ctx.show_drive_stats {
-                    let elapsed_ms = started.elapsed().as_millis().max(1) as u64;
                     info!(
                         "{: <80}",
                         format!(
