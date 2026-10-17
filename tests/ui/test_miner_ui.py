@@ -182,5 +182,86 @@ class BinaryLookupTests(unittest.TestCase):
             self.assertEqual(miner_ui.find_binary(root), exe)
 
 
+class NewParsingTests(unittest.TestCase):
+    def test_round_history_and_drive_health(self):
+        s = LogStats()
+        for line in [
+            "16:06:39 [INFO] round finished: roundtime=61234ms, speed=411.20MiB/s",
+            "16:07:39 [INFO] round finished: roundtime=58000ms, speed=430.00MiB/s",
+            "16:07:40 [INFO] \n",
+            "=== DISK HEALTH ===",
+            "Drive /mnt/bay1: \u2713 HEALTHY (errors: 0/120, rate: 0.00%, consecutive: 0; last round 57.5s at 282 MiB/s, slowest 61.2s)",
+            "Drive /mnt/bay2: \u26a0 WARNING (errors: 3/120, rate: 2.50%, consecutive: 1; last round 58.0s at 275 MiB/s, slowest 90.1s)",
+            "",
+            "16:07:41 [INFO] new block: height=1000001, scoop=5",
+        ]:
+            s.feed(line)
+        s.flush()
+        self.assertEqual(s.round_history, [(61234, 411.2), (58000, 430.0)])
+        self.assertEqual(sorted(s.drive_health), ["/mnt/bay1", "/mnt/bay2"])
+        bay2 = s.drive_health["/mnt/bay2"]
+        self.assertEqual((bay2.status, bay2.failed, bay2.total, bay2.rate, bay2.consecutive), ("WARNING", 3, 120, 2.5, 1))
+        self.assertEqual((bay2.last_round_s, bay2.speed, bay2.slowest_s), (58.0, 275.0, 90.1))
+        self.assertEqual(s.height, 1000001)
+
+    def test_plotter_stats(self):
+        from miner_ui import PlotterStats
+
+        p = PlotterStats()
+        p.feed("progress: 12.5% (512/4096 nonces), 2900 nonces/min (12.7 MB/s), elapsed 10s, eta 1m 14s")
+        self.assertEqual((p.percent, p.done, p.total, p.rate, p.mb_s, p.elapsed, p.eta), (12.5, 512, 4096, 2900, 12.7, "10s", "1m 14s"))
+        self.assertFalse(p.finished)
+        p.feed("done: 4096 nonces in 1m 25s (2891 nonces/min, 12.6 MB/s) -> /mnt/bay1/plots/5_0_4096")
+        self.assertTrue(p.finished)
+        self.assertEqual((p.percent, p.done, p.total, p.output_path), (100.0, 4096, 4096, "/mnt/bay1/plots/5_0_4096"))
+        p.feed("error: plotting failed: No space left on device (os error 28)")
+        self.assertEqual(p.error, "plotting failed: No space left on device (os error 28)")
+
+    def test_parse_device_list(self):
+        from miner_ui import parse_device_list
+
+        out = "0:0  Portable Computing Language / cpu-haswell-AMD EPYC (4 compute units, 15.6 GiB)\n0:1  P / GPU X (32 compute units, 8.0 GiB)\nNo OpenCL devices found.\n"
+        self.assertEqual(
+            parse_device_list(out),
+            [("0:0", "Portable Computing Language / cpu-haswell-AMD EPYC (4 compute units, 15.6 GiB)"), ("0:1", "P / GPU X (32 compute units, 8.0 GiB)")],
+        )
+        self.assertEqual(parse_device_list("This build has no OpenCL support"), [])
+
+    def test_accounts_in_dirs_and_settings(self):
+        import os
+        import tempfile
+
+        from miner_ui import accounts_in_dirs, load_settings, save_settings, settings_path
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for name in ["5_0_100", "5_100_50", "6_0_1000", "notes.txt", "5_x_1"]:
+                (root / name).write_text("")
+            self.assertEqual(accounts_in_dirs([str(root), str(root / "missing")]), [5, 6])
+            old = os.environ.get("XDG_CONFIG_HOME")
+            os.environ["XDG_CONFIG_HOME"] = str(root / "cfg")
+            try:
+                self.assertEqual(settings_path(), root / "cfg" / "signum-miner" / "ui.json")
+                self.assertEqual(load_settings(), {})
+                save_settings({"plotter": {"path": "/mnt/bay1/plots", "gpu": "0:0"}})
+                self.assertEqual(load_settings()["plotter"]["gpu"], "0:0")
+            finally:
+                if old is None:
+                    del os.environ["XDG_CONFIG_HOME"]
+                else:
+                    os.environ["XDG_CONFIG_HOME"] = old
+
+    def test_find_binary_by_name(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "target" / "release").mkdir(parents=True)
+            exe = root / "target" / "release" / "signum-plotter"
+            exe.write_text("#!/bin/sh\n")
+            exe.chmod(0o755)
+            self.assertEqual(miner_ui.find_binary(root, "signum-plotter"), exe)
+
+
 if __name__ == "__main__":
     unittest.main()
