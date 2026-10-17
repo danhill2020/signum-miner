@@ -228,24 +228,31 @@ box.
 
 ### GUI helper
 
-For an optional graphical interface, run `miner_ui.py` with Python 3. The UI
-uses the [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter)
-framework to provide a modern dark theme with blue accents. Install the required
-packages first:
+`miner_ui.py` is a desktop control panel for the miner, in Signum colours:
+
+![Dashboard](docs/ui-dashboard.png)
+
+- **Dashboard** – live status parsed from the miner output: block and scoop,
+  round time and read speed, capacity and unreadable plots, best deadline of
+  the current block, accepted submissions, pool state, the 5-minute metrics
+  and disk health reports.
+- **Config** – a settings editor grouped into pool/plots, performance, mining
+  and logging. Saving keeps the comments and order of your `config.yaml`;
+  *Validate* runs `signum-miner --check` on what is on screen before you
+  save; the *Raw YAML* tab is there for anything unusual.
+- **Logs** – the miner output with level colouring and a level filter.
+
 ```bash
 pip install -r requirements.txt
-```
-You can then edit `config.yaml`, start or stop the miner and monitor its log
-output in a more user friendly window.
-
-```bash
-python3 miner_ui.py
+python3 miner_ui.py                      # opens config.yaml next to the script
+python3 miner_ui.py --config /opt/signum-miner/config.yaml
 ```
 
-The CustomTkinter based UI works on Linux, macOS and Windows as long as Python 3
-is available and the `signum-miner` binary is in the same directory.
-Make sure the compiled miner binary is named **exactly** `signum-miner`,
-otherwise the UI will fail to launch it.
+The UI looks for the `signum-miner` binary next to `miner_ui.py`, then in
+`target/release` and `target/debug`, then on `PATH`. It needs Python 3.9+
+with Tk (`sudo apt-get install python3-tk` on Debian/Raspberry Pi OS).
+
+![Config](docs/ui-config.png)
 
 ---
 

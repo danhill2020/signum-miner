@@ -81,3 +81,13 @@
 
 - `contrib/signum-miner.service` systemd unit and a Raspberry Pi 5 section in
   the README.
+- Config loading tolerates a UTF-8 byte-order mark and CRLF line endings,
+  explains tab indentation and a non-list `plot_dirs`, accepts a pool URL
+  without scheme (`pool.example.com:8080`), and looks for `config.yaml` next
+  to the binary when it is not in the working directory.
+- The GUI (`miner_ui.py`) was rewritten: Signum green theme with the bundled
+  logo, a live dashboard parsed from the miner output, a typed settings editor
+  that preserves the comments and order of `config.yaml` (the old one
+  rewrote the file and dropped every comment), a *Validate* button that runs
+  `signum-miner --check`, compact colour-coded logs, and automatic discovery
+  of the miner binary. Its logic is unit tested in `tests/ui`.

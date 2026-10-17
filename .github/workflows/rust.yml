@@ -49,6 +49,17 @@ jobs:
           sed -e "s#^plot_dirs:.*#plot_dirs: ['test_data']#" -e "/^  - '/d" config.yaml > /tmp/config.yaml
           ./target/release/signum-miner --config /tmp/config.yaml --check
 
+  gui-tests:
+    name: GUI logic tests (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m unittest discover -s tests/ui -v
+
   check-opencl:
     name: check (opencl feature)
     runs-on: ubuntu-latest

@@ -181,14 +181,35 @@ impl<'de> Deserialize<'de> for Benchmark {
     }
 }
 
+/// Parse the pool/wallet URL leniently: surrounding whitespace is ignored and
+/// a missing scheme (`pool.example.com:8080`) is taken as `http://`.
+pub fn parse_pool_url(raw: &str) -> Result<::url::Url, String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("url is empty".to_string());
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+    let url =
+        ::url::Url::parse(&with_scheme).map_err(|e| format!("invalid url '{}': {}", trimmed, e))?;
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        other => Err(format!(
+            "invalid url '{}': scheme '{}' is not supported, use http:// or https://",
+            trimmed, other
+        )),
+    }
+}
+
 fn deserialize_url<'de, D>(deserializer: D) -> Result<::url::Url, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = String::deserialize(deserializer)?;
-    let trimmed = raw.trim();
-    ::url::Url::parse(trimmed)
-        .map_err(|e| serde::de::Error::custom(format!("invalid url '{}': {}", trimmed, e)))
+    parse_pool_url(&raw).map_err(serde::de::Error::custom)
 }
 
 fn default_secret_phrase() -> HashMap<u64, String> {
@@ -338,21 +359,69 @@ pub fn unknown_keys(cfg_str: &str) -> Vec<String> {
         .collect()
 }
 
+/// Where to look for the config file: the path as given, then (for the
+/// default relative name) next to the executable, so double-clicking the
+/// binary or running it from a service works without `--config`.
+pub fn resolve_config_path(config: &str) -> PathBuf {
+    let given = PathBuf::from(config);
+    if given.exists() || given.is_absolute() {
+        return given;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let beside = dir.join(config);
+            if beside.exists() {
+                return beside;
+            }
+        }
+    }
+    given
+}
+
 pub fn load_cfg(config: &str) -> Result<Cfg, String> {
-    let cfg_str = fs::read_to_string(config).map_err(|e| {
+    let path = resolve_config_path(config);
+    let raw = fs::read(&path).map_err(|e| {
         format!(
             "Failed to open config file '{}': {}. Please check that the file exists and is readable.",
-            config, e
+            path.display(),
+            e
         )
     })?;
-    parse_cfg(&cfg_str, config)
+    // Editors on Windows like to prepend a byte-order mark; YAML does not like it.
+    let raw = raw.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&raw);
+    let cfg_str = String::from_utf8_lossy(raw);
+    parse_cfg(&cfg_str, &path.display().to_string())
+}
+
+/// Explain the YAML mistakes people actually make instead of only quoting
+/// the parser.
+fn describe_yaml_error(cfg_str: &str, err: &serde_yaml::Error) -> String {
+    let mut hints = Vec::new();
+    if cfg_str.lines().any(|l| l.starts_with('\t')) {
+        hints.push("the file uses tab characters for indentation; YAML only allows spaces");
+    }
+    if cfg_str.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("plot_dirs:") && t.len() > "plot_dirs:".len() && !t.contains('[')
+    }) {
+        hints.push(
+            "plot_dirs must be a list: one '  - /path' line per directory under 'plot_dirs:'",
+        );
+    }
+    let hint = if hints.is_empty() {
+        String::new()
+    } else {
+        format!(" Hint: {}.", hints.join("; "))
+    };
+    format!("{}.{}", err, hint)
 }
 
 pub fn parse_cfg(cfg_str: &str, origin: &str) -> Result<Cfg, String> {
     let cfg: Cfg = serde_yaml::from_str(cfg_str).map_err(|e| {
         format!(
-            "Failed to parse config file '{}': {}. Please check YAML syntax.",
-            origin, e
+            "Failed to parse config file '{}': {} Please check YAML syntax.",
+            origin,
+            describe_yaml_error(cfg_str, &e)
         )
     })?;
 
@@ -537,7 +606,46 @@ mod tests {
     #[test]
     fn rejects_url_without_host() {
         let err = parse_cfg("plot_dirs: []\nurl: 'mailto:someone'\n", "inline").unwrap_err();
-        assert!(err.contains("no host"), "{}", err);
+        assert!(err.contains("invalid url"), "{}", err);
+        let err = parse_pool_url("mailto://someone").unwrap_err();
+        assert!(err.contains("scheme"), "{}", err);
+    }
+
+    #[test]
+    fn url_without_scheme_gets_http() {
+        let cfg = parse_cfg("plot_dirs: []\nurl: pool.example.com:8080/\n", "inline").unwrap();
+        assert_eq!(cfg.url.as_str(), "http://pool.example.com:8080/");
+        let cfg = parse_cfg("plot_dirs: []\nurl: 'https://pool.example.com'\n", "inline").unwrap();
+        assert_eq!(cfg.url.as_str(), "https://pool.example.com/");
+        assert!(parse_pool_url("   ").is_err());
+        assert!(parse_pool_url("ftp://x").is_err());
+    }
+
+    #[test]
+    fn bom_and_crlf_are_tolerated_and_tabs_are_explained() {
+        let dir = std::env::temp_dir().join(format!("signum-miner-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bom.yaml");
+        std::fs::write(
+            &path,
+            b"\xef\xbb\xbfplot_dirs: []\r\nurl: 'http://localhost:8125'\r\ncpu_threads: 2\r\n",
+        )
+        .unwrap();
+        let cfg = load_cfg(path.to_str().unwrap()).expect("BOM + CRLF config loads");
+        assert_eq!(cfg.cpu_threads, 2);
+
+        let path = dir.join("tabs.yaml");
+        std::fs::write(&path, "plot_dirs:\n\t- /x\nurl: 'http://localhost'\n").unwrap();
+        let err = load_cfg(path.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("tab characters"), "{}", err);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn plot_dirs_as_scalar_is_explained() {
+        let err =
+            parse_cfg("plot_dirs: /mnt/plots\nurl: 'http://localhost'\n", "inline").unwrap_err();
+        assert!(err.contains("must be a list"), "{}", err);
     }
 
     #[test]
