@@ -33,6 +33,10 @@ pub struct MinerMetrics {
     pub last_submission: Option<Instant>,
     /// Average round time in milliseconds
     pub avg_round_time_ms: f64,
+    /// Longest round so far in milliseconds
+    pub max_round_time_ms: u64,
+    /// Rounds cut short by the next block
+    pub rounds_interrupted: u64,
     /// Total bytes read
     pub total_bytes_read: u64,
 }
@@ -54,6 +58,8 @@ impl MinerMetrics {
             network_errors: 0,
             last_submission: None,
             avg_round_time_ms: 0.0,
+            max_round_time_ms: 0,
+            rounds_interrupted: 0,
             total_bytes_read: 0,
         }
     }
@@ -99,6 +105,12 @@ impl MinerMetrics {
         let alpha = 0.1; // Smoothing factor
         self.avg_round_time_ms =
             alpha * duration_ms as f64 + (1.0 - alpha) * self.avg_round_time_ms;
+        self.max_round_time_ms = self.max_round_time_ms.max(duration_ms.max(0) as u64);
+    }
+
+    /// Record a round that the next block cut short
+    pub fn record_round_interrupted(&mut self) {
+        self.rounds_interrupted += 1;
     }
 
     /// Record a failed round
@@ -171,8 +183,10 @@ impl MinerMetrics {
             self.round_success_rate()
         ));
         summary.push_str(&format!(
-            "Avg Round Time: {:.0}ms\n",
-            self.avg_round_time_ms
+            "Round Time: avg {:.1}s, max {:.1}s; {} round(s) interrupted by the next block\n",
+            self.avg_round_time_ms / 1000.0,
+            self.max_round_time_ms as f64 / 1000.0,
+            self.rounds_interrupted
         ));
         summary.push_str(&format!(
             "Submissions: {} total, {} successful, {} failed ({:.1}% success)\n",
@@ -251,6 +265,10 @@ pub struct DiskHealthInfo {
     pub failed_reads: u64,
     pub last_error: Option<Instant>,
     pub consecutive_errors: u32,
+    /// Last completed round on this drive: duration and bytes read.
+    pub last_round_ms: u64,
+    pub last_round_bytes: u64,
+    pub slowest_round_ms: u64,
 }
 
 #[allow(dead_code)]
@@ -262,6 +280,24 @@ impl DiskHealthInfo {
             failed_reads: 0,
             last_error: None,
             consecutive_errors: 0,
+            last_round_ms: 0,
+            last_round_bytes: 0,
+            slowest_round_ms: 0,
+        }
+    }
+
+    /// Record how long this drive took to read its share of a round.
+    pub fn record_round(&mut self, duration_ms: u64, bytes: u64) {
+        self.last_round_ms = duration_ms;
+        self.last_round_bytes = bytes;
+        self.slowest_round_ms = self.slowest_round_ms.max(duration_ms);
+    }
+
+    pub fn last_speed_mibs(&self) -> f64 {
+        if self.last_round_ms == 0 {
+            0.0
+        } else {
+            self.last_round_bytes as f64 / 1024.0 / 1024.0 * 1000.0 / self.last_round_ms as f64
         }
     }
 
@@ -339,14 +375,31 @@ impl DiskHealthMonitor {
             };
 
             summary.push_str(&format!(
-                "Drive {}: {} (errors: {}/{}, rate: {:.2}%, consecutive: {})\n",
+                "Drive {}: {} (errors: {}/{}, rate: {:.2}%, consecutive: {}; last round {:.1}s at {:.0} MiB/s, slowest {:.1}s)\n",
                 drive_id,
                 status,
                 info.failed_reads,
                 info.total_reads,
                 info.error_rate(),
-                info.consecutive_errors
+                info.consecutive_errors,
+                info.last_round_ms as f64 / 1000.0,
+                info.last_speed_mibs(),
+                info.slowest_round_ms as f64 / 1000.0
             ));
+        }
+        if let Some(slowest) = self
+            .drives
+            .values()
+            .filter(|i| i.last_round_ms > 0)
+            .max_by_key(|i| i.last_round_ms)
+        {
+            if self.drives.len() > 1 {
+                summary.push_str(&format!(
+                    "Slowest drive last round: {} ({:.1}s); the round cannot finish before it does\n",
+                    slowest.drive_id,
+                    slowest.last_round_ms as f64 / 1000.0
+                ));
+            }
         }
 
         summary

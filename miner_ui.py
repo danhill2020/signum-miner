@@ -290,6 +290,7 @@ OPTION_GROUPS: list[tuple[str, list[Option]]] = [
         "Mining",
         [
             Option("submit_only_best", "Submit only best deadline", "bool", default=True),
+            Option("early_submit_deadline", "Submit immediately below (s)", "int", "a deadline this short is sent at once; 0 = off", default=600),
             Option("target_deadline", "Target deadline (s)", "int", "only submit deadlines below this", default=4294967295),
             Option("get_mining_info_interval", "Poll interval (ms)", "int", default=3000),
             Option("timeout", "Request timeout (ms)", "int", default=5000),

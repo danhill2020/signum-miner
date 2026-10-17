@@ -58,6 +58,7 @@ pub struct Miner {
     get_mining_info_interval: u64,
     wakeup_after: Option<Duration>,
     submit_only_best: bool,
+    early_submit_deadline: u64,
     metrics: SharedMetrics,
     disk_health: SharedDiskHealth,
     plot_missing_grace: Duration,
@@ -90,6 +91,11 @@ pub struct State {
     /// Best result of the current round per account, held back for
     /// `submit_only_best`.
     best_nonce: HashMap<u64, NonceData>,
+    /// Nonces already sent early this round (account -> nonce), so the
+    /// round-end submission does not repeat them.
+    early_submitted: HashMap<u64, u64>,
+    /// Duration of the previous completed round, for the early-submit rule.
+    last_round_ms: u64,
 }
 
 impl State {
@@ -113,6 +119,8 @@ impl State {
             first: true,
             outage: false,
             best_nonce: HashMap::new(),
+            early_submitted: HashMap::new(),
+            last_round_ms: 0,
         }
     }
 
@@ -138,7 +146,13 @@ impl State {
         self.height = mining_info.height;
         self.block += 1;
         self.base_target = mining_info.base_target;
-        self.server_target_deadline = mining_info.target_deadline;
+        // Some pools send 0 for "no limit"; taken literally it would mean
+        // "never submit anything".
+        self.server_target_deadline = if mining_info.target_deadline == 0 {
+            u64::MAX
+        } else {
+            mining_info.target_deadline
+        };
         self.generation_signature_bytes = gensig_bytes;
         self.generation_signature = mining_info.generation_signature.clone();
 
@@ -154,16 +168,33 @@ impl State {
         self.chunks_expected = 0;
         self.chunks_seen = 0;
         self.best_nonce.clear();
+        self.early_submitted.clear();
         self.scanning = true;
         true
     }
 
-    /// The best deadline of the current round for every account that found one.
+    /// A deadline this short may expire before the round is over, so it is
+    /// worth sending straight away rather than with the round-end batch.
+    fn submit_early(&self, deadline: u64, early_submit_deadline: u64) -> bool {
+        if early_submit_deadline == 0 {
+            return false;
+        }
+        // Two previous round lengths plus some slack covers the time until
+        // this round's final submission would go out.
+        let round_risk = (self.last_round_ms / 1000)
+            .saturating_mul(2)
+            .saturating_add(30);
+        deadline <= early_submit_deadline.max(round_risk)
+    }
+
+    /// The best deadline of the current round for every account that found
+    /// one and whose best was not already sent early.
     fn best_submissions(&self) -> Vec<Submission> {
         let mut out: Vec<Submission> = self
             .best_nonce
             .values()
             .filter(|best| best.height == self.height)
+            .filter(|best| self.early_submitted.get(&best.account_id) != Some(&best.nonce))
             .map(|best| {
                 let deadline = best.deadline / best.base_target.max(1);
                 Submission::from_nonce(best, deadline, self.generation_signature_bytes)
@@ -559,6 +590,22 @@ impl Miner {
             0
         };
 
+        let drive_count = scan.drives.len();
+        if cfg.hdd_reader_thread_count > 0 && cfg.hdd_reader_thread_count < drive_count {
+            warn!(
+                "hdd_reader_thread_count={} is lower than the number of drives ({}); some drives will be read one after another, which makes every round longer. Set it to 0 to use one thread per drive.",
+                cfg.hdd_reader_thread_count, drive_count
+            );
+        }
+        if cpu_buffer_count > 0 && cpu_buffer_count < drive_count {
+            warn!(
+                "only {} read buffers for {} drives; raise cpu_worker_task_count to at least {} so every drive can read while the CPU hashes",
+                cpu_buffer_count,
+                drive_count,
+                drive_count.saturating_sub(cpu_threads).max(1)
+            );
+        }
+
         let reader_threads_label = if cfg.hdd_reader_thread_count == 0 {
             format!("{} (one per drive)", scan.drives.len().max(1))
         } else {
@@ -775,6 +822,7 @@ impl Miner {
                 None
             },
             submit_only_best: cfg.submit_only_best,
+            early_submit_deadline: cfg.early_submit_deadline,
             metrics,
             disk_health,
             plot_missing_grace: Duration::from_secs(cfg.plot_missing_grace),
@@ -967,6 +1015,9 @@ impl Miner {
                     state.outage = false;
                 }
                 if mining_info.generation_signature != state.generation_signature {
+                    if state.scanning && state.reader_task_count > 0 {
+                        write_or_recover(&self.metrics).record_round_interrupted();
+                    }
                     let interrupted = if self.submit_only_best {
                         state.take_interrupted_round()
                     } else {
@@ -1057,6 +1108,20 @@ impl Miner {
 
             if self.submit_only_best {
                 state.best_nonce.insert(nonce_data.account_id, nonce_data);
+                if state.submit_early(deadline, self.early_submit_deadline) {
+                    info!(
+                        "deadline {}s found, submitting now rather than at the end of the round",
+                        deadline
+                    );
+                    state
+                        .early_submitted
+                        .insert(nonce_data.account_id, nonce_data.nonce);
+                    submissions.push(Submission::from_nonce(
+                        &nonce_data,
+                        deadline,
+                        state.generation_signature_bytes,
+                    ));
+                }
             } else {
                 submissions.push(Submission::from_nonce(
                     &nonce_data,
@@ -1102,6 +1167,7 @@ impl Miner {
                     submissions.extend(state.best_submissions());
                 }
 
+                state.last_round_ms = round_time_ms;
                 state.round_started = Instant::now();
                 state.scanning = false;
             }
@@ -1244,6 +1310,62 @@ mod tests {
         assert_eq!(bytes, 0);
         assert!(retained.is_empty());
         assert_eq!(dropped.len(), 1);
+    }
+
+    #[test]
+    fn early_submission_rule() {
+        let mut state = State::new();
+        assert!(!state.submit_early(5, 0), "disabled");
+        assert!(state.submit_early(600, 600));
+        assert!(!state.submit_early(601, 600));
+        // A long previous round widens the window: 2 * 200s + 30s = 430s.
+        state.last_round_ms = 200_000;
+        assert!(state.submit_early(400, 100));
+        assert!(!state.submit_early(431, 100));
+    }
+
+    #[test]
+    fn early_submitted_nonce_is_not_sent_again_at_round_end() {
+        let mut state = State::new();
+        state.height = 10;
+        state.scanning = true;
+        let nonce = NonceData {
+            height: 10,
+            block: 1,
+            base_target: 1,
+            deadline: 12,
+            nonce: 77,
+            reader_task_processed: false,
+            drive_chunks: 0,
+            account_id: 5,
+        };
+        state.best_nonce.insert(5, nonce);
+        state.early_submitted.insert(5, 77);
+        assert!(state.best_submissions().is_empty());
+        // A later, better nonce for the same account is still sent.
+        state.best_nonce.insert(
+            5,
+            NonceData {
+                nonce: 78,
+                deadline: 3,
+                ..nonce
+            },
+        );
+        assert_eq!(state.best_submissions().len(), 1);
+    }
+
+    #[test]
+    fn target_deadline_zero_means_no_limit() {
+        let mut state = State::new();
+        let info = MiningInfo {
+            generation_signature:
+                "4a6f686e6e7946464d206861742064656e206772f6df74656e2050656e697321".into(),
+            base_target: 100,
+            height: 5,
+            target_deadline: 0,
+        };
+        assert!(state.update_mining_info(&info));
+        assert_eq!(state.server_target_deadline, u64::MAX);
     }
 
     #[test]
