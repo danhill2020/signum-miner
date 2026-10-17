@@ -289,7 +289,28 @@ with Tk (`sudo apt-get install python3-tk` on Debian/Raspberry Pi OS).
 `cargo build --release` also builds `signum-plotter`, which writes PoC2 plot
 files in the `<account>_<start nonce>_<nonces>` format the miner reads. The
 output is verified byte for byte against an independent reference generator
-in the test suite, for the CPU and the GPU path.
+in the test suite, for every CPU instruction set and the GPU path.
+
+It is built for speed. On the CPU, 16 (AVX-512), 8 (AVX2) or 4 (SSE2, AVX,
+NEON) nonces are hashed at once with the same parallel Shabal code the miner
+uses, on all cores; an x86 build picks the widest instruction set the CPU
+has at run time. The GPU kernel keeps its work buffer interleaved by nonce so
+every memory access of a wavefront is coalesced, which is what separates a
+memory-bound from a compute-bound plotter. Generation and writing overlap,
+and each scoop is written in one large piece per chunk (256 KiB with the
+default buffers), so a hard drive runs near its sequential speed.
+
+Measured on a 4-core Xeon @ 2.8 GHz (nonces per minute, 1 nonce = 256 KiB):
+
+| Generator                       | 4 threads | 1 thread |
+|---------------------------------|----------:|---------:|
+| previous scalar code            |     3 500 |      900 |
+| AVX2, 8 lanes                   |    17 000 |    4 600 |
+| AVX-512, 16 lanes               |    37 700 |   11 800 |
+
+37 700 nonces/min is 165 MB/s, more than a USB 3 hard drive writes. A GPU
+has not been measured here (only the pocl CPU emulation, where the new kernel
+is 1.6x the old one); on a real GPU the drive will be the limit.
 
 ```bash
 # 4 TB plot (1 GB = 4096 nonces), continuing after this account's existing
@@ -306,24 +327,32 @@ signum-plotter -i 10282355196851764065 -p /mnt/bay1/plots --size-gb 4000 --gpu 0
 
 # How fast is this machine? Generates without writing anything.
 signum-plotter -i 1 -p . --nonces 65536 --bench --gpu 0:0
+
+# Bigger write buffers (8 GB of RAM instead of a quarter of the machine's):
+# every scoop is written in 1 MiB pieces, the best case for hard drives
+signum-plotter -i 10282355196851764065 -p /mnt/bay1/plots --size-gb 4000 --mem 8
 ```
 
 Notes:
 
-- One file per run. The plotter preallocates the file, writes it scoop by
-  scoop (no re-sorting pass) and removes it again if the run fails, so the
-  miner never sees a half-written plot. Check free space first: 256 KiB per
-  nonce.
-- `--batch` sets how many nonces are generated per round trip (default 512
-  on the CPU, 2048 on a GPU); memory use is about `batch × 512 KiB`. A
-  bigger batch keeps a large GPU busier.
+- One file per run. The plotter really preallocates the file (`fallocate`,
+  so it is not fragmented by the 4096 interleaved write streams), writes it
+  scoop by scoop (no re-sorting pass) and removes it again if the run fails,
+  so the miner never sees a half-written plot. Check free space first:
+  256 KiB per nonce.
+- `--mem` is the RAM for the two write buffers (default: a quarter of the
+  machine's RAM, at most 4 GB). Each scoop is written in one piece per
+  buffer, so 2 GB buffers mean 256 KiB writes and 8 GB mean 1 MiB writes.
+  On a hard drive bigger is faster; on the Pi 5 (8 GB) the default is fine.
+- `--batch` (GPU only) is the number of nonces per kernel launch, by default
+  sized to half of the device memory (512 KiB per nonce in flight).
 - A GPU is only faster when the drive can keep up: a USB 3 bay writes at
-  100–200 MB/s, i.e. 25–45k nonces/min, which a mid-range GPU easily
-  exceeds. The `done:` line reports the achieved MB/s.
+  100–200 MB/s, i.e. 25–45k nonces/min, which an AVX-512 CPU or any modern
+  GPU already exceeds. The `done:` line reports the achieved MB/s.
 - The Raspberry Pi 5's VideoCore GPU has no OpenCL driver, so on the Pi the
-  plotter uses the four CPU cores (expect a few thousand nonces/min). For
-  large farms plot on a PC with a GPU and move the drives, or let the Pi plot
-  in the background while it mines (`--threads 2` leaves cores for the miner).
+  plotter uses the four CPU cores with NEON. For large farms plot on a PC
+  and move the drives, or let the Pi plot in the background while it mines
+  (`--threads 2` leaves cores for the miner).
 - Plots made by other PoC2 plotters (the Signum `plotter` / `engraver`)
   are compatible either way.
 

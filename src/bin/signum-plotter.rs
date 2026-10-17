@@ -15,7 +15,10 @@ mod plotter;
 
 use clap::{Arg, ArgAction, Command};
 use plotter::poc2::NONCE_SIZE;
-use plotter::{format_duration, next_free_nonce, CpuGenerator, NonceGenerator, PlotJob, Progress};
+use plotter::{
+    chunk_for_memory, default_chunk_nonces, format_duration, next_free_nonce, CpuGenerator,
+    NonceGenerator, PlotJob, Progress,
+};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process;
@@ -93,7 +96,14 @@ fn main() {
                 .short('b')
                 .long("batch")
                 .value_name("NONCES")
-                .help("Nonces per batch (default 512 CPU, 2048 GPU); memory = batch * 256 KiB * 2"),
+                .help("GPU only: nonces per kernel launch (default: sized from the device memory)"),
+        )
+        .arg(
+            Arg::new("mem")
+                .short('m')
+                .long("mem")
+                .value_name("GB")
+                .help("RAM for the two write buffers (default: a quarter of the machine's RAM, at most 4 GB); bigger means larger, faster disk writes"),
         )
         .arg(
             Arg::new("bench")
@@ -167,12 +177,17 @@ fn main() {
 
     let gpu = m.get_one::<String>("gpu").cloned();
     let mut generator: Box<dyn NonceGenerator> = match gpu {
-        None => Box::new(CpuGenerator),
+        None => {
+            if let Err(e) = plotter::cpu::check_cpu_support() {
+                fail(&e);
+            }
+            Box::new(CpuGenerator::new())
+        }
         Some(spec) => {
             cfg_if! {
                 if #[cfg(feature = "opencl")] {
                     let (platform, device) = parse_device(&spec);
-                    let batch = parse_u64(&m, "batch").unwrap_or(2048) as usize;
+                    let batch = parse_u64(&m, "batch").map(|b| b as usize);
                     match plotter::gpu::GpuGenerator::new(platform, device, batch) {
                         Ok(g) => Box::new(g),
                         Err(e) => fail(&format!("cannot use GPU {}: {}", spec, e)),
@@ -184,10 +199,18 @@ fn main() {
             }
         }
     };
-    let batch = parse_u64(&m, "batch")
-        .map(|b| b as usize)
-        .unwrap_or(if m.contains_id("gpu") { 2048 } else { 512 })
-        .max(1);
+    let chunk = match m.get_one::<String>("mem") {
+        Some(gb) => {
+            let gb: f64 = gb
+                .parse()
+                .unwrap_or_else(|_| fail(&format!("--mem must be a number of GB, got '{}'", gb)));
+            if gb.is_nan() || gb <= 0.0 {
+                fail("--mem must be positive");
+            }
+            chunk_for_memory((gb * 1e9) as u64)
+        }
+        None => default_chunk_nonces(),
+    };
 
     let quiet = m.get_flag("quiet");
     let job = PlotJob {
@@ -195,7 +218,7 @@ fn main() {
         start_nonce,
         nonces,
         directory,
-        batch: batch.min(nonces as usize),
+        chunk,
         dry_run: m.get_flag("bench"),
     };
     if !job.dry_run {
@@ -229,8 +252,16 @@ fn main() {
         }
     );
     }
-    if !quiet && !job.dry_run {
-        eprintln!("writing {}", job.path().display());
+    if !quiet {
+        eprintln!(
+            "chunks of {} nonces ({:.2} GB of RAM for the two buffers, {} KiB per scoop write)",
+            job.chunk_nonces(),
+            job.buffer_bytes() as f64 / 1e9,
+            job.chunk_nonces() * 64 / 1024
+        );
+        if !job.dry_run {
+            eprintln!("writing {}", job.path().display());
+        }
     }
 
     let started = Instant::now();

@@ -70,6 +70,24 @@
 - Buffered reads (the fallback for filesystems without direct I/O) advise
   the kernel to read ahead and drop the pages afterwards.
 
+### Changed (plotter speed)
+
+- CPU plotting hashes 16 (AVX-512), 8 (AVX2) or 4 (SSE2/AVX/NEON) nonces at
+  once with the parallel Shabal implementations the miner already carries,
+  and an x86 build picks the widest instruction set the CPU has at run time.
+  On a 4-core AVX-512 machine: 37 700 nonces/min instead of 3 500 (AVX2:
+  17 000). Every instruction set is checked against the byte-level reference
+  in the tests.
+- The GPU kernel keeps its work buffer interleaved by nonce (coalesced
+  memory access) and a second kernel writes the finished scoops in the
+  plot's scoop-major order, read back with one rectangular copy straight
+  into the write buffer. The kernel batch is sized from the device memory.
+- The plot file is preallocated with `fallocate` (no fragmentation) and
+  written in large chunks: `--mem` sets the RAM for the two write buffers
+  (default a quarter of the machine's RAM), and every scoop is written in
+  one piece per chunk, so writes are 256 KiB or larger instead of 32 KiB.
+  The GUI has a matching memory field.
+
 ### Added (plotter and GUI)
 
 - `signum-plotter`, a PoC2 plotter built alongside the miner. CPU plotting
