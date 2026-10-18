@@ -527,6 +527,7 @@ PLOT_PROGRESS_RE = re.compile(
 )
 PLOT_DONE_RE = re.compile(r"^done: (\d+) nonces in (.+?) \((\d+) nonces/min, ([\d.]+) MB/s\)")
 PLOT_ERROR_RE = re.compile(r"^error: (.*)$")
+PLOT_RESUME_RE = re.compile(r"^resuming: (\d+) of (\d+) nonces were already on disk")
 PLOT_DEVICE_RE = re.compile(r"^(\d+):(\d+)\s+(.+)$")
 
 
@@ -542,10 +543,13 @@ class PlotterStats:
     finished: bool = False
     error: str = ""
     output_path: str = ""
+    resumed_from: int = 0
 
     def feed(self, line: str) -> None:
         text = line.strip()
-        if m := PLOT_PROGRESS_RE.search(text):
+        if m := PLOT_RESUME_RE.search(text):
+            self.resumed_from = int(m.group(1))
+        elif m := PLOT_PROGRESS_RE.search(text):
             self.percent = float(m.group(1))
             self.done, self.total = int(m.group(2)), int(m.group(3))
             self.rate, self.mb_s = int(m.group(4)), float(m.group(5))
@@ -970,8 +974,11 @@ class MinerUI:
         self.plot_mem = tk.StringVar(value=saved.get("mem_gb", ""))
         row(6, "Memory (GB)", ctk.CTkEntry(form, textvariable=self.plot_mem, width=140), "write buffers; empty = a quarter of RAM; more = bigger writes")
 
+        self.plot_low_priority = tk.BooleanVar(value=bool(saved.get("low_priority", True)))
+        row(7, "Priority", ctk.CTkCheckBox(form, text="low (keeps the miner responsive)", variable=self.plot_low_priority), "an unfinished plot resumes when started again")
+
         btns = ctk.CTkFrame(form, fg_color="transparent")
-        btns.grid(row=7, column=0, columnspan=3, sticky="ew", padx=14, pady=(8, 12))
+        btns.grid(row=8, column=0, columnspan=3, sticky="ew", padx=14, pady=(8, 12))
         self.plot_start_btn = ctk.CTkButton(btns, text="▶  Start plotting", height=38, font=(FONT, 13, "bold"), command=self.start_plotter)
         self.plot_start_btn.pack(side="left")
         self.plot_stop_btn = ctk.CTkButton(btns, text="■  Stop", height=38, fg_color=SURFACE_ALT, hover_color=ERROR, text_color=TEXT, state="disabled", command=self.stop_plotter)
@@ -1391,6 +1398,8 @@ class MinerUI:
                 messagebox.showerror(APP_NAME, "Memory must be a positive number of GB (or empty).")
                 return None
             cmd += ["--mem", mem]
+        if self.plot_low_priority.get():
+            cmd.append("--low-priority")
         if bench:
             cmd.append("--bench")
         return cmd
@@ -1422,6 +1431,7 @@ class MinerUI:
             "device": self.plot_device.get(),
             "threads": self.plot_threads.get(),
             "mem_gb": self.plot_mem.get(),
+            "low_priority": self.plot_low_priority.get(),
         }
 
     def bench_plotter(self) -> None:
@@ -1603,6 +1613,7 @@ class MinerUI:
             "device": self.plot_device.get(),
             "threads": self.plot_threads.get(),
             "mem_gb": self.plot_mem.get(),
+            "low_priority": self.plot_low_priority.get(),
         }
         save_settings(self.settings)
 

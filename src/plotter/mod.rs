@@ -15,12 +15,61 @@ pub mod gpu;
 
 pub use cpu::CpuGenerator;
 use poc2::NONCE_SIZE;
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::io;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use writer::PlotWriter;
+pub use writer::{Existing, NONCES_PER_BLOCK};
+use writer::{PlotWriter, DIRECT_IO_ALIGNMENT};
+
+/// A page-aligned, zero-initialised chunk buffer (direct I/O needs the
+/// alignment; `Vec<u8>` gives no such guarantee).
+pub struct ChunkBuf {
+    ptr: *mut u8,
+    layout: Layout,
+}
+
+impl ChunkBuf {
+    pub fn new(len: usize) -> Self {
+        let layout = Layout::from_size_align(len.max(1), DIRECT_IO_ALIGNMENT).expect("layout");
+        // SAFETY: non-zero size, valid layout.
+        let ptr = unsafe { alloc_zeroed(layout) };
+        assert!(
+            !ptr.is_null(),
+            "out of memory allocating a {} byte chunk",
+            len
+        );
+        Self { ptr, layout }
+    }
+}
+
+impl Deref for ChunkBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: the allocation is `layout.size()` initialised bytes.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.layout.size()) }
+    }
+}
+
+impl DerefMut for ChunkBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` guarantees exclusive access.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.layout.size()) }
+    }
+}
+
+impl Drop for ChunkBuf {
+    fn drop(&mut self) {
+        // SAFETY: allocated with this layout in `new`.
+        unsafe { dealloc(self.ptr, self.layout) }
+    }
+}
+
+// SAFETY: a plain owned allocation.
+unsafe impl Send for ChunkBuf {}
 
 /// Something that produces consecutive nonces straight into a scoop-major
 /// chunk: scoop `s` of nonce index `n` lives at `(s * chunk_nonces + n) * 64`.
@@ -52,6 +101,17 @@ pub struct PlotJob {
     pub chunk: usize,
     /// Generate only, do not write (benchmark).
     pub dry_run: bool,
+    /// Write with direct I/O where the filesystem allows it.
+    pub direct_io: bool,
+}
+
+/// What `run` did.
+#[derive(Clone, Debug)]
+pub struct Outcome {
+    pub path: PathBuf,
+    /// Nonces that were already on disk when the run started.
+    pub resumed_from: u64,
+    pub direct_io: bool,
 }
 
 impl PlotJob {
@@ -99,12 +159,13 @@ impl Progress {
 }
 
 /// Run a plot job.  `on_progress` is called after every generator batch with
-/// the number of nonces generated so far.
+/// the number of nonces done so far (including any resumed ones).  An
+/// unfinished plot of the same name is continued from its resume marker.
 pub fn run(
     job: &PlotJob,
     generator: &mut dyn NonceGenerator,
     mut on_progress: impl FnMut(Progress),
-) -> io::Result<PathBuf> {
+) -> io::Result<Outcome> {
     let chunk_nonces = job.chunk_nonces();
     let max_batch = generator.max_batch();
     let batch = if max_batch == 0 {
@@ -115,18 +176,30 @@ pub fn run(
     let path = job.path();
     let started = Instant::now();
 
-    let mut writer = if job.dry_run {
-        None
+    let (mut writer, resumed_from) = if job.dry_run {
+        (None, 0)
     } else {
-        Some(PlotWriter::create(&path, job.nonces)?)
+        let (w, existing) = PlotWriter::open(&path, job.nonces, job.direct_io)?;
+        match existing {
+            Existing::New => (Some(w), 0),
+            Existing::Resume(done) => (Some(w), done),
+            Existing::Finished => {
+                return Ok(Outcome {
+                    path,
+                    resumed_from: job.nonces,
+                    direct_io: w.uses_direct_io(),
+                })
+            }
+        }
     };
+    let direct_io = writer.as_ref().map(|w| w.uses_direct_io()).unwrap_or(false);
 
     // Writer thread: receives (first, count, chunk), writes, hands the buffer back.
-    let (tx_full, rx_full) = mpsc::sync_channel::<(u64, usize, Vec<u8>)>(1);
-    let (tx_empty, rx_empty) = mpsc::channel::<Vec<u8>>();
+    let (tx_full, rx_full) = mpsc::sync_channel::<(u64, usize, ChunkBuf)>(1);
+    let (tx_empty, rx_empty) = mpsc::channel::<ChunkBuf>();
     for _ in 0..2 {
         tx_empty
-            .send(vec![0u8; chunk_nonces * NONCE_SIZE])
+            .send(ChunkBuf::new(chunk_nonces * NONCE_SIZE))
             .expect("channel open");
     }
     let writer_thread = thread::spawn(move || -> io::Result<()> {
@@ -144,7 +217,16 @@ pub fn run(
         Ok(())
     });
 
-    let mut done = 0u64;
+    let mut done = resumed_from;
+    if resumed_from > 0 {
+        // Tell the caller where we pick up before any work is done.
+        on_progress(Progress {
+            done: resumed_from,
+            total: job.nonces,
+            nonces_per_minute: 0.0,
+            elapsed: Duration::ZERO,
+        });
+    }
     let mut result = Ok(());
     'chunks: while done < job.nonces {
         let count = chunk_nonces.min((job.nonces - done) as usize);
@@ -171,7 +253,9 @@ pub fn run(
             on_progress(Progress {
                 done: generated,
                 total: job.nonces,
-                nonces_per_minute: generated as f64 / elapsed.as_secs_f64().max(1e-9) * 60.0,
+                nonces_per_minute: (generated - resumed_from) as f64
+                    / elapsed.as_secs_f64().max(1e-9)
+                    * 60.0,
                 elapsed,
             });
         }
@@ -186,7 +270,42 @@ pub fn run(
         .unwrap_or_else(|_| Err(io::Error::other("writer thread panicked")));
     result?;
     writer_result?;
-    Ok(path)
+    Ok(Outcome {
+        path,
+        resumed_from,
+        direct_io,
+    })
+}
+
+/// Lower the process priority so a miner on the same machine keeps its
+/// cores (Unix `nice`; a no-op elsewhere).
+pub fn set_low_priority() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: plain syscall on the calling process.
+        return unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) } == 0;
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// Free space on the filesystem holding `dir`, in bytes.
+#[cfg(unix)]
+pub fn free_space(dir: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: valid C string and out-pointer.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+pub fn free_space(_dir: &Path) -> Option<u64> {
+    None
 }
 
 /// Chunk size (nonces) for a memory budget of `bytes` across both buffers.
@@ -305,13 +424,56 @@ mod tests {
             directory: dir.clone(),
             chunk: 3,
             dry_run: false,
+            direct_io: true,
         };
         let mut progress = Vec::new();
-        let path = run(&job, &mut Limited(CpuGenerator::new()), |p| {
+        let outcome = run(&job, &mut Limited(CpuGenerator::new()), |p| {
             progress.push(p.done)
         })
         .unwrap();
         assert_eq!(progress, vec![2, 3, 5, 6, 8]);
+        assert_eq!(outcome.resumed_from, 0);
+        let ours = std::fs::read(&outcome.path).unwrap();
+        let reference = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("test_data")
+                .join("10282355196851764065_0_8"),
+        )
+        .unwrap();
+        assert!(ours[..ours.len() - 8] == reference[..reference.len() - 8]);
+        // Running the same job again finds a finished plot and does nothing.
+        let again = run(&job, &mut Limited(CpuGenerator::new()), |_| {}).unwrap();
+        assert_eq!(again.resumed_from, 8);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A plot interrupted after its first chunk is continued, not restarted.
+    #[test]
+    fn run_resumes_an_unfinished_plot() {
+        let dir = std::env::temp_dir().join(format!("signum-plotter-rr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = PlotJob {
+            account_id: 10282355196851764065,
+            start_nonce: 0,
+            nonces: 8,
+            directory: dir.clone(),
+            chunk: 8,
+            dry_run: false,
+            direct_io: false,
+        };
+        // Pretend an earlier run wrote the first 64-nonce block... which for an
+        // 8-nonce plot cannot be: the marker is rounded down to 0, so the
+        // whole plot is redone.  Use the writer directly for a marker of 5.
+        let path = job.path();
+        {
+            let (mut w, _) = PlotWriter::open(&path, 8, false).unwrap();
+            let chunk = poc2::scoop_major_reference(job.account_id, 0, 5, 5, 0);
+            w.write_chunk(0, &chunk, 5).unwrap();
+        }
+        let mut progress = Vec::new();
+        let outcome = run(&job, &mut CpuGenerator::new(), |p| progress.push(p.done)).unwrap();
+        assert_eq!(outcome.resumed_from, 0);
+        assert_eq!(progress, vec![8]);
         let ours = std::fs::read(&path).unwrap();
         let reference = std::fs::read(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -320,6 +482,10 @@ mod tests {
         )
         .unwrap();
         assert!(ours[..ours.len() - 8] == reference[..reference.len() - 8]);
+        assert_eq!(
+            &ours[ours.len() - 8..],
+            &[8, 0, 0, 0, 0xAF, 0xFE, 0xAF, 0xFE]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
